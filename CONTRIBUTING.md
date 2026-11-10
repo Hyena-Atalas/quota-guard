@@ -25,6 +25,10 @@ python3 quota_guard.py scan \
 
 If you add a log shape, add a constructed fixture and a test. Prefer skipping an unknown record with a warning over guessing.
 
+Idle detection must stay anchored to the last real user input, ignore tool_result / sidechain / system injections, leave cache_read out of the idle increment, and classify long autonomous runs as `long_run` rather than `idle_drain`.
+
+`.jsonl.zst` support is optional (`compression.zstd` or the `zstandard` package). Without a backend, those files must be skipped with `zst_unsupported`, not a crash. The `zstd` extra is `pip install zstandard`.
+
 ## Issues
 
 Use the issue templates. Redact timelines. Do not upload raw session files.

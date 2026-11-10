@@ -1,0 +1,2 @@
+{"type": "user", "timestamp": "2026-11-10T03:10:00.000Z", "sessionId": "sess-subagent", "message": {"role": "user", "content": "subagent work"}}
+{"type": "assistant", "timestamp": "2026-11-10T03:14:00.000Z", "sessionId": "sess-subagent", "requestId": "sa1", "message": {"id": "msa1", "usage": {"input_tokens": 2000, "output_tokens": 1000, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}}

@@ -1,0 +1,4 @@
+{"type": "user", "timestamp": "2026-11-10T01:00:00.000Z", "sessionId": "sess-tool-result", "message": {"role": "user", "content": "please run tests"}}
+{"type": "assistant", "timestamp": "2026-11-10T01:00:05.000Z", "sessionId": "sess-tool-result", "requestId": "r1", "message": {"id": "m1", "usage": {"input_tokens": 40, "output_tokens": 10, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}}
+{"type": "assistant", "timestamp": "2026-11-10T01:04:10.000Z", "sessionId": "sess-tool-result", "requestId": "r2", "message": {"id": "m2", "usage": {"input_tokens": 500, "output_tokens": 300, "cache_read_input_tokens": 8000, "cache_creation_input_tokens": 0}}}
+{"type": "user", "timestamp": "2026-11-10T01:06:00.000Z", "sessionId": "sess-tool-result", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}}

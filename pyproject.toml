@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "quota-guard"
-version = "0.1.0"
+version = "0.2.0"
 description = "Free, read-only CLI that looks for idle token and quota drain in local Claude Code and Codex CLI logs."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -21,8 +21,12 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Utilities",
 ]
+
+[project.optional-dependencies]
+zstd = ["zstandard>=0.22"]
 
 [project.scripts]
 quota-guard = "quota_guard:main"

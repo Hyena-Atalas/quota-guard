@@ -1,0 +1,4 @@
+{"type": "user", "timestamp": "2026-11-10T07:00:00.000Z", "sessionId": "sess-meta", "message": {"role": "user", "content": "run a check"}}
+{"type": "assistant", "timestamp": "2026-11-10T07:00:05.000Z", "sessionId": "sess-meta", "requestId": "me1", "message": {"id": "mme1", "usage": {"input_tokens": 20, "output_tokens": 10, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}}
+{"type": "user", "timestamp": "2026-11-10T07:04:00.000Z", "sessionId": "sess-meta", "isMeta": true, "message": {"role": "user", "content": [{"type": "text", "text": "<system-reminder>idle reminder</system-reminder>"}]}}
+{"type": "assistant", "timestamp": "2026-11-10T07:04:10.000Z", "sessionId": "sess-meta", "requestId": "me2", "message": {"id": "mme2", "usage": {"input_tokens": 400, "output_tokens": 200, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}}

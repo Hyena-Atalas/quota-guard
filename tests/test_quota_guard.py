@@ -72,10 +72,15 @@ class TestEightOneSamples(unittest.TestCase):
         alert = self.by_id["sess-idle"]
         self.assertEqual(alert.source, "claude")
         self.assertEqual(alert.alert_type, "A")
-        self.assertEqual(alert.idle_tokens, 5100)
+        # New tokens only: 400+300+50 = 750. cache_read 50000 is not counted.
+        self.assertEqual(alert.idle_tokens, 750)
+        self.assertEqual(alert.idle_cache_read, 50000)
         sess = self.result.sessions["claude:sess-idle"]
-        # Immediate reply (1350) + idle (5100); the duplicate line is not added.
-        self.assertEqual(sess.total_tokens, 1350 + 5100)
+        # Immediate reply (100+50+200=350) + idle (750); the duplicate line is not added.
+        self.assertEqual(sess.total_tokens, 350 + 750)
+        self.assertEqual(sess.total_cache_read, 1000 + 50000)
+        # Anchor is the last real user, and it precedes first idle usage.
+        self.assertLess(alert.last_user_ts, alert.first_idle_usage_ts)
 
     def test_claude_active_session_not_flagged(self) -> None:
         self.assertIn("claude:sess-ok", self.result.sessions)
@@ -83,15 +88,17 @@ class TestEightOneSamples(unittest.TestCase):
         self.assertNotIn("sess-ok", self.by_id)
 
     def test_codex_idle_delta_and_percent(self) -> None:
-        # total_token_usage 1460-1040=420; primary used_percent 10 -> 18.
+        # new-token cumulative 1350-250=1100; primary used_percent 10 -> 18.
+        # cache is subtracted from input so it is not part of the idle increment.
         alert = self.by_id["sess-codex-idle"]
         self.assertEqual(alert.source, "codex")
         self.assertEqual(alert.alert_type, "A")
-        self.assertEqual(alert.idle_tokens, 420)
+        self.assertEqual(alert.idle_tokens, 1100)
         self.assertIsNotNone(alert.percent_step)
         self.assertAlmostEqual(alert.percent_step or 0, 8.0)
         self.assertIn("primary", alert.reason)
         self.assertIn("8.0", alert.reason)
+        self.assertLess(alert.last_user_ts, alert.first_idle_usage_ts)
 
     def test_codex_ghost_quota_type_b(self) -> None:
         # Tokens stay at 60; secondary used_percent 5 -> 33.
@@ -100,7 +107,7 @@ class TestEightOneSamples(unittest.TestCase):
         self.assertEqual(alert.alert_type, "B")
         self.assertEqual(alert.idle_tokens, 0)
         self.assertAlmostEqual(alert.percent_step or 0, 28.0)
-        self.assertIn("no matching local token_count delta", alert.reason)
+        self.assertIn("no matching local new-token delta", alert.reason)
         self.assertIn("shared quota pool", alert.reason)
 
 
@@ -112,9 +119,11 @@ class TestDedup(unittest.TestCase):
         events = qg.parse_claude_file(path, warnings)
         usage = [e for e in events if e.kind == "usage"]
         self.assertEqual(len(usage), 2)
-        self.assertEqual(usage[0].tokens, 1350)
-        self.assertEqual(usage[1].tokens, 5100)
-        self.assertEqual(sum(e.tokens for e in usage), 6450)
+        self.assertEqual(usage[0].tokens, 350)
+        self.assertEqual(usage[0].cache_read, 1000)
+        self.assertEqual(usage[1].tokens, 750)
+        self.assertEqual(usage[1].cache_read, 50000)
+        self.assertEqual(sum(e.tokens for e in usage), 1100)
 
 
 class TestTruncatedAndOddRecords(unittest.TestCase):
@@ -179,15 +188,18 @@ class TestDiscoveryAndAliases(unittest.TestCase):
         events = qg.parse_claude_file(path, [])
         usage = [e for e in events if e.kind == "usage"]
         self.assertEqual(len(usage), 1)
-        # 4 + 6 + cached_input_tokens 2 + cache_creation 0 = 12
-        self.assertEqual(usage[0].tokens, 12)
+        # new = 4+6+0 = 10; cached_input_tokens 2 is recorded separately.
+        self.assertEqual(usage[0].tokens, 10)
+        self.assertEqual(usage[0].cache_read, 2)
 
     def test_codex_accepts_cache_read_input_tokens_alias(self) -> None:
         path = EXTRA_CODEX / "archived_sessions" / "rollout-sess-archived.jsonl"
         events = qg.parse_codex_file(path, [])
         usage = [e for e in events if e.kind == "usage"]
         self.assertEqual(len(usage), 1)
-        self.assertEqual(usage[0].tokens, 35)
+        # new = (30-10)+5+0 = 25; cache_read 10 is not added.
+        self.assertEqual(usage[0].tokens, 25)
+        self.assertEqual(usage[0].cache_read, 10)
         self.assertEqual(usage[0].note, "total_token_usage")
 
     def test_codex_sum_parts_does_not_add_cache_again(self) -> None:
@@ -195,9 +207,10 @@ class TestDiscoveryAndAliases(unittest.TestCase):
         events = qg.parse_codex_file(path, [])
         usage = [e for e in events if e.kind == "usage"]
         self.assertEqual(len(usage), 1)
-        # input 12 + output 3 + reasoning 1; cache_read 4 is not added.
-        self.assertEqual(usage[0].tokens, 16)
-        self.assertEqual(usage[0].note, "sum_parts")
+        # (12-4)+3+1 = 12; cache_read 4 is not added to new tokens.
+        self.assertEqual(usage[0].tokens, 12)
+        self.assertEqual(usage[0].cache_read, 4)
+        self.assertIn("last_token_usage", usage[0].note)
 
     def test_env_var_roots(self) -> None:
         env = {
@@ -387,7 +400,7 @@ class TestCLI(unittest.TestCase):
     def test_version(self) -> None:
         proc = run_cli(["--version"])
         self.assertEqual(proc.returncode, 0, msg=proc.stderr)
-        self.assertIn("0.1.0", proc.stdout)
+        self.assertIn("0.2.0", proc.stdout)
 
     def test_default_subcommand_is_scan(self) -> None:
         with_scan = run_cli(
@@ -418,8 +431,9 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(proc.returncode, 2, msg=proc.stderr + proc.stdout)
         payload = json.loads(proc.stdout)
         by_id = {a["session_id"]: a for a in payload["alerts"]}
-        self.assertEqual(by_id["sess-idle"]["idle_tokens"], 5100)
-        self.assertEqual(by_id["sess-codex-idle"]["idle_tokens"], 420)
+        self.assertEqual(by_id["sess-idle"]["idle_tokens"], 750)
+        self.assertEqual(by_id["sess-idle"]["idle_cache_read"], 50000)
+        self.assertEqual(by_id["sess-codex-idle"]["idle_tokens"], 1100)
         self.assertAlmostEqual(by_id["sess-codex-idle"]["percent_step"], 8.0)
         self.assertEqual(by_id["sess-ghost"]["idle_tokens"], 0)
         self.assertAlmostEqual(by_id["sess-ghost"]["percent_step"], 28.0)

@@ -1,0 +1,4 @@
+{"type": "assistant", "timestamp": "2026-11-10T05:04:00.000Z", "sessionId": "sess-ooo", "requestId": "o2", "message": {"id": "mo2", "usage": {"input_tokens": 800, "output_tokens": 200, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}}
+{"type": "user", "timestamp": "2026-11-10T05:10:00.000Z", "sessionId": "sess-ooo", "message": {"role": "user", "content": "thanks, next question"}}
+{"type": "user", "timestamp": "2026-11-10T05:00:00.000Z", "sessionId": "sess-ooo", "message": {"role": "user", "content": "start here"}}
+{"type": "assistant", "timestamp": "2026-11-10T05:00:08.000Z", "sessionId": "sess-ooo", "requestId": "o1", "message": {"id": "mo1", "usage": {"input_tokens": 20, "output_tokens": 10, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}}

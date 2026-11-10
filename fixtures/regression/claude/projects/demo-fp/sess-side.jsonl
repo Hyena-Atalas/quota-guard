@@ -1,0 +1,2 @@
+{"type": "user", "timestamp": "2026-11-10T03:00:00.000Z", "sessionId": "sess-side", "isSidechain": true, "message": {"role": "user", "content": "side task"}}
+{"type": "assistant", "timestamp": "2026-11-10T03:04:00.000Z", "sessionId": "sess-side", "isSidechain": true, "requestId": "s1", "message": {"id": "ms1", "usage": {"input_tokens": 2000, "output_tokens": 1000, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}}

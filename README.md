@@ -57,20 +57,25 @@ python3 tests/test_quota_guard.py
 # or: python3 -m unittest discover -s tests -v
 ```
 
+A first run on your own machine, including how to read the summary line and how to share a redacted result, is in [`docs/real-run-howto.md`](docs/real-run-howto.md).
+
 Useful flags (on `scan` and `report`):
 
 | Flag | Meaning |
 | --- | --- |
 | `--claude-root`, `--codex-root` | Override log/config roots |
-| `--idle-seconds` | Idle window, default 180 |
-| `--token-threshold` | Minimum local token delta to flag, default 1 |
-| `--percent-threshold` | Minimum Codex `used_percent` step to flag, default 1.0 |
+| `--idle-seconds` | Quiet gap after the last real user input, default 180 |
+| `--token-threshold` | Minimum *new* tokens (not cache_read) in that gap, default 200 |
+| `--percent-threshold` | Minimum Codex `used_percent` step to flag, default 2.0 |
+| `--long-run-seconds` | Continuous work longer than this is `long_run`, not idle drain, default 1800 |
+| `--min-severity` | `low` / `medium` / `high`; default `medium` hides `long_run` |
+| `--explain SESSION_HASH` | Print only that session's timeline (no prompt text) |
 | `--report PATH` | Write a markdown evidence report |
-| `--json` | Machine-readable stdout |
+| `--json` | Machine-readable stdout, including the summary object |
 | `--no-hash` | Show raw session ids (default: SHA-256 prefix) |
 | `--no-redact-home` | Leave home-directory prefixes in paths (default: replace with `~`) |
 
-Exit status: `0` if no alerts, `2` if one or more idle-drain alerts, `1` on a hard error.
+Exit status: `0` if no alerts are *shown* at the current `--min-severity`, `2` if one or more are shown, `1` on a hard error or a failed `--explain`.
 
 ## Paths it reads
 
@@ -79,12 +84,14 @@ Only these, and only as files, never as a login:
 | Tool | Default root | What is scanned |
 | --- | --- | --- |
 | Claude Code | `$CLAUDE_CONFIG_DIR` or `~/.claude` | `projects/**/*.jsonl`, recursively, including `subagents/` |
-| Codex CLI | `$CODEX_HOME` or `~/.codex` (Windows: `%USERPROFILE%\.codex`) | `sessions/**/rollout-*.jsonl` and `archived_sessions/**/rollout-*.jsonl` |
+| Codex CLI | `$CODEX_HOME` or `~/.codex` (Windows: `%USERPROFILE%\.codex`) | `sessions/**/rollout-*.jsonl` and `archived_sessions/**/rollout-*.jsonl`, including `.jsonl.zst` |
 | `check-config` only | same roots | `~/.codex/config.toml` and `~/.claude/settings.json` |
 
 `CLAUDE_CONFIG_DIR` may be a comma-separated list. Some community tools report that behavior; whether it is official complete behavior is **unverified**. This tool does **not** automatically also scan `~/.config/claude`.
 
 Custom roots work on Windows and POSIX because paths are handled with `pathlib`.
+
+`.jsonl.zst` files are decompressed with Python 3.14's `compression.zstd` or, if you install it, the optional [`zstandard`](https://pypi.org/project/zstandard/) package (`pip install zstandard` or `pip install 'quota-guard[zstd]'`). If neither is available, those files are counted as `skipped: zst_unsupported` and the scan continues. The summary line always reports how many files were found, scanned, and skipped.
 
 ## Paths it does not read
 
@@ -99,11 +106,15 @@ If a credentials-like filename appears next to logs, it is skipped on purpose.
 
 ## Detection types (and their limits)
 
-The idle window defaults to **3 minutes** and is configurable.
+The quiet gap defaults to **3 minutes** and is configurable. Detection walks events in **timestamp order** and uses the **last real user prompt** as the only anchor. Tool results, `isSidechain` / `subagents/` records, and meta or `<system-reminder>` injections are not anchors. Usage while a tool call is still open is treated as part of the same run.
 
-**Type A — local tokens grew after idle.** After the last *user* input in that session file, reconstructed local tokens still increased. That can be background work the official apps document (memories, recap, idle compaction, prompt suggestions, scheduled tasks, and similar), a session that did not actually stop, or a long task you started earlier. This is **not** proof of a vendor bug.
+**New tokens vs cache reads.** Idle increments use `input_tokens + output_tokens + cache_creation_input_tokens` (plus Codex `reasoning_output_tokens` when present). `cache_read_input_tokens` / `cached_input_tokens` are recorded on the timeline and **not** added. A later turn that mostly rereads a large cache can show tens of millions of cache_read tokens and still correctly stay under the new-token threshold (default 200).
 
-**Type B — Codex `used_percent` rose, but local `token_count` did not.** The official client writes rate-limit snapshots into local Codex logs. Those snapshots are **not a live API** and may lag. A Type B alert means: *this machine's log did not show a matching token delta*. It does **not** mean the usage is fake. Common explanations you should consider first:
+**Type A — new tokens grew after a quiet gap.** After the last real user input, there was a gap of at least `--idle-seconds` with no activity (and no open tool call), and then new tokens increased by at least `--token-threshold`. That can be background work the official apps document (memories, recap, idle compaction, prompt suggestions, scheduled tasks, and similar), or a session that did not actually stop. This is **not** proof of a vendor bug.
+
+**Long runs are not idle drain.** If you gave the agent a task and it kept working without a quiet gap, that is expected. If that continuous run lasts at least `--long-run-seconds` (default 30 minutes), quota-guard emits a low-severity `long_run` alert instead of `idle_drain`. Those alerts are hidden unless you pass `--min-severity low`.
+
+**Type B — Codex `used_percent` rose, but local new tokens did not.** The official client writes rate-limit snapshots into local Codex logs. Those snapshots are **not a live API** and may lag. A Type B alert means: *this machine's log did not show a matching new-token delta after the quiet gap*. It does **not** mean the usage is fake. Common explanations you should consider first:
 
 - **Shared quota pools.** Some plans share usage across Codex, ChatGPT, and other surfaces. This tool only sees the logs on *this* machine.
 - **Other devices** signed into the same account.
