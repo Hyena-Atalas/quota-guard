@@ -38,6 +38,36 @@ LEAKY_RAW_SECRETS = [
 REDACTED_EVIDENCE_RE = re.compile(r"^(?:\*\*\*|\S{2}\*\*\*) \(len=\d+\)$")
 
 
+
+def highentropy_raw_secrets() -> list[str]:
+    """Read constructed FAKE values from the high-entropy fixture (not hard-coded twice)."""
+    settings = json.loads(
+        (FIXTURES / "leaky-highentropy" / ".claude" / "settings.local.json").read_text(encoding="utf-8")
+    )
+    blob = "\n".join(settings["permissions"]["allow"])
+    values: list[str] = []
+    for pat in (
+        r"PGPASSWORD=(\S+)",
+        r"sshpass\s+-p\s+(\S+)",
+        r"mysql(?:\s+\S+)*\s+-p(?![\s\-\"')\]]|$)([^\s\"')\]]{4,})",
+        r"Bearer\s+(\S+?)" + r'(?=["\s)])',
+    ):
+        for m in re.finditer(pat, blob):
+            values.append(m.group(1).rstrip('"'))
+    plain = (FIXTURES / "leaky-highentropy" / "FAKE-github-pat.txt").read_text(encoding="utf-8")
+    for line in plain.splitlines():
+        if line.startswith("token="):
+            values.append(line.split("=", 1)[1].strip())
+    # Unique, drop empties. All values in this fixture are marked FAKE.
+    out: list[str] = []
+    for v in values:
+        if v and v not in out:
+            out.append(v)
+    if len(out) < 2:
+        raise RuntimeError("failed to extract FAKE high-entropy fixture values")
+    return out
+
+
 def isolate_fixture(name: str, dest: Path) -> Path:
     """Copy a fixture tree out of this repo so parent-repo git hygiene does not leak into tests."""
     src = FIXTURES / name
@@ -148,6 +178,43 @@ class SecretsScanTests(unittest.TestCase):
         self.assertIn("redacted", md.lower())
         self.assertIn("line ", md.lower())
 
+
+    def test_highentropy_fixture_catches_command_passwords_and_redacts(self) -> None:
+        raw = highentropy_raw_secrets()
+        self.assertTrue(any(v.startswith("ghp_FAKE") and len(v) == 40 for v in raw))
+        self.assertTrue(all("FAKE" not in v or v.startswith("ghp_FAKE") for v in raw))
+        with tempfile.TemporaryDirectory() as td:
+            root = isolate_fixture("leaky-highentropy", Path(td))
+            result = secrets_scan.run_scan(root, skip_git=True)
+            rules = {f.rule_id for f in result.findings}
+            self.assertIn("pgpassword", rules)
+            self.assertIn("sshpass-p", rules)
+            self.assertIn("mysql-p", rules)
+            self.assertTrue(
+                any(
+                    r == "authorization-bearer"
+                    or "authorization-bearer" in r
+                    or r == "github-pat"
+                    or "github-pat" in r
+                    for r in rules
+                ),
+                f"Bearer/GitHub token not flagged: {rules}",
+            )
+            payload = json.dumps(secrets_scan.result_to_json(result), ensure_ascii=False)
+            md = secrets_scan.render_report_text(result)
+            combined = payload + "\n" + md
+            for secret in raw:
+                self.assertNotIn(secret, combined, "raw high-entropy fixture value appeared in output")
+                assert_evidence_is_tight(
+                    self,
+                    next(
+                        f.evidence
+                        for f in result.findings
+                        if f.evidence.startswith(secret[:2] + "***") or (len(secret) <= 2 and f.evidence.startswith("***"))
+                    ),
+                    secret,
+                )
+
     def test_redact_never_includes_suffix_or_short_values(self) -> None:
         self.assertEqual(secrets_scan.redact("ab"), "*** (len=2)")
         self.assertEqual(secrets_scan.redact("abc"), "ab*** (len=3)")
@@ -229,6 +296,32 @@ class SecretsCliTests(unittest.TestCase):
             md = report.read_text(encoding="utf-8")
             assert_no_raw_secrets(self, proc.stdout + proc.stderr + md, "secrets CLI output")
             self.assertIn("line ", md)
+
+
+    def test_secrets_cli_highentropy_redacts(self) -> None:
+        raw = highentropy_raw_secrets()
+        proc = run_cli(
+            [
+                "secrets",
+                "--root",
+                str(FIXTURES / "leaky-highentropy"),
+                "--skip-git",
+                "--json",
+            ]
+        )
+        self.assertEqual(proc.returncode, 2)
+        payload = json.loads(proc.stdout)
+        rules = {f["rule_id"] for f in payload["findings"]}
+        self.assertIn("pgpassword", rules)
+        self.assertIn("sshpass-p", rules)
+        self.assertIn("mysql-p", rules)
+        self.assertTrue(
+            any("authorization-bearer" in r or "github-pat" in r for r in rules),
+            f"Bearer/GitHub token not flagged: {rules}",
+        )
+        combined = proc.stdout + proc.stderr
+        for secret in raw:
+            self.assertNotIn(secret, combined, "raw high-entropy fixture value appeared in CLI output")
 
     def test_usage_is_alias_of_scan(self) -> None:
         common = [

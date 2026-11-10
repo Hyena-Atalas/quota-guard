@@ -736,8 +736,14 @@ def assert_no_raw_leak(public_text: str, raw_secrets: Iterable[str]) -> None:
 
 
 def dedupe_findings(findings: list[Finding]) -> list[Finding]:
-    """Keep one finding per (path, redacted evidence), preferring command-password
-    rules, then known prefixes, then the first seen."""
+    """Keep one finding per (path, line, redacted evidence).
+
+    Line is part of the key so two different secrets that happen to redact
+    to the same snippet (for example two FAKE*** passwords of equal length)
+    stay distinct. The same value on the same line, caught by both a
+    command-password rule and a known-prefix rule, still collapses to one
+    finding, preferring command-password rules, then known prefixes.
+    """
     priority = {
         "command-embedded-password": 0,
         "known-token-format": 1,
@@ -745,9 +751,9 @@ def dedupe_findings(findings: list[Finding]) -> list[Finding]:
         "git-hygiene": 3,
         "ssh-forward-agent": 4,
     }
-    best: dict[tuple[str, str], Finding] = {}
+    best: dict[tuple[str, int | None, str], Finding] = {}
     for f in findings:
-        key = (f.path, f.evidence)
+        key = (f.path, f.line, f.evidence)
         prev = best.get(key)
         if prev is None or priority.get(f.category, 9) < priority.get(prev.category, 9):
             best[key] = f
