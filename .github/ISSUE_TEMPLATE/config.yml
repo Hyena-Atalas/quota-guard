@@ -1,5 +1,5 @@
 blank_issues_enabled: true
 contact_links:
   - name: Waitlist
-    url: "<WAITLIST_FORM_URL>"
+    url: "https://docs.google.com/forms/d/e/1FAIpQLSdAGJXUIATq7lv0Au0DtOY84om0Mwnlhi-JDqXmHhhQVGZH9g/viewform"
     about: Leave an email if you want to hear about later work. Replace this placeholder before publishing. GitHub issues make addresses public, so a form is preferred.

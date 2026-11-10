@@ -1,8 +1,7 @@
 # quota-guard
 
-**Waitlist:** [join here](<WAITLIST_FORM_URL>)
+**Waitlist:** [join here](https://docs.google.com/forms/d/e/1FAIpQLSdAGJXUIATq7lv0Au0DtOY84om0Mwnlhi-JDqXmHhhQVGZH9g/viewform)
 
-> Replace `<WAITLIST_FORM_URL>` with your Google Form or Tally link before you publish. A field list lives in [`docs/waitlist-form-spec.md`](docs/waitlist-form-spec.md). Replace `<REPO_URL>` and Hyena-Atalas the same way.
 
 Free, open-source, **read-only** CLI that inspects **local** Claude Code and Codex CLI session logs for a simple pattern: token counts or Codex quota percentages that keep moving after you have not entered a prompt for a while.
 
@@ -22,7 +21,7 @@ It is **not an official quota dashboard**. It does not contact OpenAI or Anthrop
 Requires **Python 3.11+** (the standard library only; `check-config` uses `tomllib`).
 
 ```bash
-git clone <REPO_URL>
+git clone https://github.com/Hyena-Atalas/quota-guard
 cd quota-guard
 
 # No install required:
@@ -163,8 +162,8 @@ quota-guard does **not** read Keychain or call unofficial usage APIs the way som
 
 ## Feedback
 
-- Waitlist (paid tray / later work, if it happens): `<WAITLIST_FORM_URL>`
-- Issues: `<REPO_URL>/issues`
+- Waitlist (paid tray / later work, if it happens): `https://docs.google.com/forms/d/e/1FAIpQLSdAGJXUIATq7lv0Au0DtOY84om0Mwnlhi-JDqXmHhhQVGZH9g/viewform`
+- Issues: `https://github.com/Hyena-Atalas/quota-guard/issues`
   - “I caught an idle-drain event” — please send a **redacted** timeline only
   - “I ran it successfully” — install/run feedback, including whether timestamps roughly line up with `/usage` or `/status`
 
