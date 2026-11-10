@@ -2,7 +2,7 @@
 
 **Waitlist:** [join here](<WAITLIST_FORM_URL>)
 
-> Replace `<WAITLIST_FORM_URL>` with your Google Form or Tally link before you publish. A field list lives in [`docs/waitlist-form-spec.md`](docs/waitlist-form-spec.md). Replace `<REPO_URL>` and `<AUTHOR>` the same way.
+> Replace `<WAITLIST_FORM_URL>` with your Google Form or Tally link before you publish. A field list lives in [`docs/waitlist-form-spec.md`](docs/waitlist-form-spec.md). Replace `<REPO_URL>` and Hyena-Atalas the same way.
 
 Free, open-source, **read-only** CLI that inspects **local** Claude Code and Codex CLI session logs for a simple pattern: token counts or Codex quota percentages that keep moving after you have not entered a prompt for a while.
 
@@ -174,4 +174,4 @@ If you are the person publishing this repository, say so in community posts. Dra
 
 ## License
 
-MIT. Copyright (c) 2026 `<AUTHOR>`.
+MIT. Copyright (c) 2026 Hyena-Atalas.

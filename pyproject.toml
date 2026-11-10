@@ -8,8 +8,7 @@ version = "0.4.0"
 description = "Free, read-only CLI that looks for idle token and quota drain in local Claude Code and Codex CLI logs."
 readme = "README.md"
 license = { file = "LICENSE" }
-# Author is a placeholder. Replace <AUTHOR> before you publish the repository.
-authors = [{ name = "<AUTHOR>" }]
+authors = [{ name = "Hyena-Atalas" }]
 requires-python = ">=3.11"
 keywords = ["claude", "codex", "quota", "cli"]
 classifiers = [
