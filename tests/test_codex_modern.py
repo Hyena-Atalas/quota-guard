@@ -104,6 +104,9 @@ class TestModernAnchors(unittest.TestCase):
         idle = [a for a in alerts if a.alert_type == "A"]
         self.assertEqual(len(idle), 1)
         self.assertEqual(idle[0].idle_tokens, 480)
+        self.assertEqual(idle[0].severity, "medium")
+        self.assertEqual(idle[0].confidence, "high")
+        self.assertIn("after a task_complete", idle[0].reason)
         self.assertIn("anchor type: client_authored=true", idle[0].reason)
 
     def test_inherited_only_is_not_an_anchor(self) -> None:
@@ -122,7 +125,10 @@ class TestModernAnchors(unittest.TestCase):
         idle = [a for a in alerts if a.alert_type == "A"]
         self.assertEqual(len(idle), 1)
         self.assertEqual(idle[0].idle_tokens, 300)
+        self.assertEqual(idle[0].severity, "low")
+        self.assertEqual(idle[0].confidence, "low")
         self.assertIn("anchor type: fallback_role_user", idle[0].reason)
+        self.assertIn("low confidence", idle[0].reason)
 
     def test_no_user_messages_reason(self) -> None:
         st, _ = parse_named("rollout-sess-no-user.jsonl")
@@ -230,6 +236,8 @@ class TestExplainAndSummaryReasons(unittest.TestCase):
         self.assertIn("Anchor type: client_authored=true", proc.stdout)
         self.assertIn("ANCHOR (last real user input; client_authored=true)", proc.stdout)
         self.assertIn("task_started", proc.stdout)
+        self.assertIn("task_complete", proc.stdout)
+        self.assertIn("turn_id=turn-main", proc.stdout)
         self.assertIn("turn_trigger=constructed_trigger", proc.stdout)
         self.assertNotIn(PROMPT, proc.stdout)
 

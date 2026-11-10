@@ -3,7 +3,8 @@
 
 Reads Claude Code JSONL transcripts and Codex CLI rollout JSONL files
 (including .jsonl.zst when a decompressor is available). Detects new-token
-or quota-percent growth after a quiet gap following the last real user input.
+or quota-percent growth in a quiet gap after a turn has completed
+(task_complete), not merely because the last user prompt was a while ago.
 
 This tool does NOT read credentials, call provider APIs, or kill processes.
 Unknown or incomplete log records are skipped with a warning; they do not
@@ -28,18 +29,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, TextIO
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
-# Default idle window: usage after this many seconds of quiet following the
-# last real user input (and after any in-progress tool call) is "idle".
+# Default idle window: for logs with turn events, post-complete usage after
+# this many seconds of quiet is "idle". Without turn events, the same gap is
+# measured from the last real user input (low confidence).
 DEFAULT_IDLE_SECONDS = 180
 # Minimum *new* token delta (input+output+cache_creation; not cache_read)
 # in the post-gap window before we emit an idle_drain alert.
 DEFAULT_TOKEN_THRESHOLD = 200
 # Minimum Codex used_percent step to flag when local new tokens are 0.
 DEFAULT_PERCENT_THRESHOLD = 2.0
-# Continuous work after a real user prompt is not idle_drain. If it lasts
-# at least this long, emit a low-severity long_run alert instead.
+# A turn that stays open (or runs continuously until task_complete) is not
+# idle_drain. If it lasts at least this long, emit a low-severity long_run
+# alert instead.
 DEFAULT_LONG_RUN_SECONDS = 1800
 DEFAULT_MIN_SEVERITY = "medium"
 
@@ -388,12 +391,23 @@ def read_log_text(path: Path, warnings: list[ParseWarning]) -> tuple[str | None,
 
 
 @dataclass
+class TurnSpan:
+    """A Codex turn bounded by task_started and, when present, task_complete."""
+
+    turn_id: str
+    start_ts: datetime | None
+    end_ts: datetime | None
+    is_subagent: bool = False
+    completed: bool = False
+
+
+@dataclass
 class Event:
     source: str  # claude | codex
     session_id: str
     path: str
     ts: datetime | None
-    kind: str  # user | inherited_user | tool_result | tool_use | usage | quota | meta | sidechain | turn_start
+    kind: str  # user | inherited_user | tool_result | tool_use | usage | quota | meta | sidechain | turn_start | turn_end
     tokens: int = 0  # new tokens: input+output+cache_creation/cache_write (+ reasoning)
     cache_read: int = 0
     used_percent: float | None = None
@@ -408,6 +422,7 @@ class Event:
     resets_at: datetime | None = None
     response_id: str = ""
     turn_id: str = ""
+    root_turn_id: str = ""
     turn_trigger: str = ""  # raw value; not interpreted
     initiating_agent_path: str = ""
 
@@ -426,6 +441,9 @@ class SessionState:
     is_sidechain: bool = False
     last_anchor_type: str = ""
     no_anchor_reason: str | None = None  # no_user_messages | all_inherited | sub_agent
+    turns: list[TurnSpan] = field(default_factory=list)
+    has_turn_events: bool = False
+    post_complete_usage_events: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -1081,6 +1099,14 @@ def _token_usage_from_record(payload: dict[str, Any]) -> tuple[TokenSplit | None
     return None, "", False
 
 
+def _payload_turn_ids(payload: dict[str, Any], rec: dict[str, Any]) -> tuple[str, str]:
+    """Read turn_id and root_turn_id without inventing other field meanings."""
+    attrib = payload.get("turn_attribution") if isinstance(payload.get("turn_attribution"), dict) else {}
+    turn_id = str(attrib.get("turn_id") or payload.get("turn_id") or rec.get("turn_id") or "")
+    root = str(attrib.get("root_turn_id") or payload.get("root_turn_id") or rec.get("root_turn_id") or "")
+    return turn_id, root
+
+
 def parse_codex_file(
     path: Path, warnings: list[ParseWarning] | None = None
 ) -> list[Event]:
@@ -1223,7 +1249,40 @@ def parse_codex_file(
                 record_type="event_msg/task_started",
                 is_sidechain=is_sub,
                 turn_id=turn_id,
+                root_turn_id=root_turn,
                 turn_trigger=trigger_s,
+                initiating_agent_path=path_s,
+            )
+            events.append(ev)
+            continue
+
+        # Confirmed turn-end: event_msg/task_complete only. Other names such as
+        # turn_aborted / interrupted have not been confirmed in live logs and
+        # are not guessed here.
+        if typ == "event_msg" and payload.get("type") == "task_complete":
+            if ts is None:
+                ts = parse_ts(payload.get("completed_at") or payload.get("started_at"))
+            attrib = payload.get("turn_attribution") if isinstance(payload.get("turn_attribution"), dict) else {}
+            turn_id, root_turn = _payload_turn_ids(payload, rec)
+            agent_path = attrib.get("initiating_agent_path")
+            path_s = _stringify_path(agent_path)
+            is_sub = initiating_path_looks_nested(agent_path)
+            if is_sub:
+                if turn_id:
+                    subagent_turns.add(turn_id)
+                if root_turn:
+                    subagent_turns.add(root_turn)
+            ev = Event(
+                "codex",
+                session_id,
+                str(path),
+                ts,
+                "turn_end",
+                note=f"task_complete turn_id={turn_id} root_turn_id={root_turn}",
+                record_type="event_msg/task_complete",
+                is_sidechain=is_sub,
+                turn_id=turn_id,
+                root_turn_id=root_turn,
                 initiating_agent_path=path_s,
             )
             events.append(ev)
@@ -1239,6 +1298,7 @@ def parse_codex_file(
             split, src, is_cum = _token_usage_from_record(payload)
             response_id = str(payload.get("response_id") or "")
             turn_id = str(payload.get("turn_id") or "")
+            root_turn_id = str(payload.get("root_turn_id") or "")
             if split is None:
                 continue
             if response_id and response_id in seen_response_ids:
@@ -1271,6 +1331,7 @@ def parse_codex_file(
                     record_type="token_usage_record",
                     response_id=response_id,
                     turn_id=turn_id,
+                    root_turn_id=root_turn_id,
                 )
                 usage_record_events.append(ev)
                 events.append(ev)
@@ -1459,7 +1520,7 @@ def build_sessions(events: list[Event]) -> dict[str, SessionState]:
 
 
 def _finalize_session(st: SessionState) -> None:
-    """Set no_anchor_reason and whether the *whole* session is a sub-agent."""
+    """Set no_anchor_reason, turn spans, and whether the *whole* session is a sub-agent."""
     main_users = [e for e in st.events if e.kind == "user" and not e.is_sidechain]
     inherited = [e for e in st.events if e.kind == "inherited_user"]
     side_users = [e for e in st.events if e.kind == "user" and e.is_sidechain]
@@ -1467,7 +1528,8 @@ def _finalize_session(st: SessionState) -> None:
     sub_activity = [
         e
         for e in st.events
-        if e.is_sidechain and e.kind in {"user", "usage", "turn_start", "inherited_user"}
+        if e.is_sidechain
+        and e.kind in {"user", "usage", "turn_start", "turn_end", "inherited_user"}
     ]
     if main_users:
         last = max(main_users, key=lambda e: e.ts or _min_utc())
@@ -1475,21 +1537,20 @@ def _finalize_session(st: SessionState) -> None:
         st.last_anchor_type = last.anchor_type
         st.no_anchor_reason = None
         st.is_sidechain = False
-        return
-    st.last_user_ts = None
-    st.last_anchor_type = ""
-    if sub_activity and not main_usage and not main_users:
-        st.is_sidechain = True
-        st.no_anchor_reason = "sub_agent"
-        return
-    if side_users and not main_users:
-        st.is_sidechain = True
-        st.no_anchor_reason = "sub_agent"
-        return
-    if inherited:
-        st.no_anchor_reason = "all_inherited"
-        return
-    st.no_anchor_reason = "no_user_messages"
+    else:
+        st.last_user_ts = None
+        st.last_anchor_type = ""
+        if sub_activity and not main_usage and not main_users:
+            st.is_sidechain = True
+            st.no_anchor_reason = "sub_agent"
+        elif side_users and not main_users:
+            st.is_sidechain = True
+            st.no_anchor_reason = "sub_agent"
+        elif inherited:
+            st.no_anchor_reason = "all_inherited"
+        else:
+            st.no_anchor_reason = "no_user_messages"
+    _attach_turn_stats(st)
 
 
 @dataclass
@@ -1509,6 +1570,7 @@ class Alert:
     run_seconds: float | None = None
     limit_id: str = ""
     limit_name: str = ""
+    confidence: str = "high"  # high | low
 
     def public_dict(
         self,
@@ -1541,8 +1603,183 @@ def _event_sort_key(ev: Event) -> tuple[datetime, int, str]:
         "sidechain": 6,
         "quota": 7,
         "usage": 8,
+        "turn_end": 9,  # after usage at the same timestamp: still in-turn
     }
-    return (ev.ts or _min_utc(), kind_rank.get(ev.kind, 9), ev.kind)
+    return (ev.ts or _min_utc(), kind_rank.get(ev.kind, 10), ev.kind)
+
+
+
+def _attach_turn_stats(st: SessionState) -> None:
+    st.turns = build_turn_spans(st.events)
+    st.has_turn_events = any(e.kind in {"turn_start", "turn_end"} for e in st.events)
+    st.post_complete_usage_events = sum(
+        1
+        for e in st.events
+        if e.kind == "usage"
+        and e.ts
+        and not e.is_sidechain
+        and classify_usage_against_turns(e, st.turns) in {"post_complete", "inter_gap"}
+    )
+
+
+def build_turn_spans(events: list[Event]) -> list[TurnSpan]:
+    """Pair task_started with a later task_complete that shares turn_id (FIFO)."""
+    starts = sorted((e for e in events if e.kind == "turn_start"), key=_event_sort_key)
+    ends = sorted((e for e in events if e.kind == "turn_end"), key=_event_sort_key)
+    ends_by_id: dict[str, list[Event]] = defaultdict(list)
+    for ev in ends:
+        ends_by_id[ev.turn_id].append(ev)
+    used: set[int] = set()
+    turns: list[TurnSpan] = []
+    for start in starts:
+        match: Event | None = None
+        for ev in ends_by_id.get(start.turn_id, []):
+            if id(ev) in used:
+                continue
+            if ev.ts is None or start.ts is None or ev.ts >= start.ts:
+                match = ev
+                break
+        if match is not None:
+            used.add(id(match))
+            turns.append(
+                TurnSpan(
+                    turn_id=start.turn_id,
+                    start_ts=start.ts,
+                    end_ts=match.ts,
+                    is_subagent=start.is_sidechain or match.is_sidechain,
+                    completed=True,
+                )
+            )
+        else:
+            turns.append(
+                TurnSpan(
+                    turn_id=start.turn_id,
+                    start_ts=start.ts,
+                    end_ts=None,
+                    is_subagent=start.is_sidechain,
+                    completed=False,
+                )
+            )
+    for ev in ends:
+        if id(ev) in used:
+            continue
+        turns.append(
+            TurnSpan(
+                turn_id=ev.turn_id,
+                start_ts=None,
+                end_ts=ev.ts,
+                is_subagent=ev.is_sidechain,
+                completed=True,
+            )
+        )
+    return turns
+
+
+def _ts_in_turn(ts: datetime, turn: TurnSpan) -> bool:
+    if turn.start_ts is not None and ts < turn.start_ts:
+        return False
+    if turn.completed:
+        if turn.end_ts is not None and ts > turn.end_ts:
+            return False
+        # Completed with no start: only treat timestamps at or before complete
+        # as in-interval when a start is also missing.
+        if turn.start_ts is None and turn.end_ts is not None:
+            return ts <= turn.end_ts
+        return True
+    # Still open: everything at or after start belongs to the turn.
+    if turn.start_ts is not None:
+        return ts >= turn.start_ts
+    return False
+
+
+def _turn_ids_of(ev: Event) -> set[str]:
+    return {x for x in (ev.turn_id, ev.root_turn_id) if x}
+
+
+def classify_usage_against_turns(ev: Event, turns: list[TurnSpan]) -> str:
+    """Classify a usage event relative to known turns.
+
+    Returns one of: in_turn, open_turn, post_complete, inter_gap, sub_agent, unattributed.
+    """
+    if ev.kind != "usage" or ev.ts is None:
+        return "unattributed"
+    if ev.is_sidechain:
+        return "sub_agent"
+    ts = ev.ts
+    ids = _turn_ids_of(ev)
+
+    def occupying() -> list[TurnSpan]:
+        return [t for t in turns if not t.is_subagent and _ts_in_turn(ts, t)]
+
+    if ids:
+        matched = [t for t in turns if t.turn_id and t.turn_id in ids]
+        in_matched = [t for t in matched if _ts_in_turn(ts, t)]
+        if in_matched:
+            return "open_turn" if any(not t.completed for t in in_matched) else "in_turn"
+        others = occupying()
+        if others:
+            return "open_turn" if any(not t.completed for t in others) else "in_turn"
+        post = [
+            t
+            for t in matched
+            if t.completed and t.end_ts is not None and ts > t.end_ts and not t.is_subagent
+        ]
+        if post:
+            return "post_complete"
+    others = occupying()
+    if others:
+        return "open_turn" if any(not t.completed for t in others) else "in_turn"
+    prior = [
+        t
+        for t in turns
+        if t.completed and t.end_ts is not None and ts > t.end_ts and not t.is_subagent
+    ]
+    if prior:
+        return "inter_gap"
+    return "unattributed"
+
+
+def _next_start_or_user(events: list[Event], after: datetime) -> datetime | None:
+    for ev in events:
+        if ev.ts is None or ev.ts <= after or ev.is_sidechain:
+            continue
+        if ev.kind in {"turn_start", "user"}:
+            return ev.ts
+    return None
+
+
+def _latest_complete_before(turns: list[TurnSpan], ts: datetime) -> datetime | None:
+    ends = [
+        t.end_ts
+        for t in turns
+        if t.completed and t.end_ts is not None and t.end_ts < ts and not t.is_subagent
+    ]
+    return max(ends) if ends else None
+
+
+def collect_open_turn_windows(sessions: dict[str, SessionState]) -> list[tuple[datetime, datetime | None]]:
+    """[start, end) periods when a non-sub-agent turn is open, across sessions."""
+    windows: list[tuple[datetime, datetime | None]] = []
+    for st in sessions.values():
+        for t in st.turns:
+            if t.is_subagent or t.start_ts is None:
+                continue
+            windows.append((t.start_ts, t.end_ts if t.completed else None))
+    return windows
+
+
+def interval_overlaps_open_turn(
+    start: datetime,
+    end: datetime,
+    windows: list[tuple[datetime, datetime | None]],
+) -> bool:
+    """True if (start, end] overlaps a turn that is still open in [turn_start, turn_end)."""
+    for lo, hi in windows:
+        # Open period is [lo, hi) if completed, else [lo, +inf).
+        open_hi = hi if hi is not None else datetime.max.replace(tzinfo=timezone.utc)
+        if lo < end and open_hi > start:
+            return True
+    return False
 
 
 def _session_percent_step_after_gap(
@@ -1612,9 +1849,10 @@ def detect_type_b_global(
 
     Snapshots are grouped by limit_id across all sessions (shared quota pools).
     A change in resets_at starts a new window and is not treated as growth.
-    If any local, non-sub-agent session has new tokens in the open interval
-    (baseline_ts, later_ts], the rise is not reported as Type B.
+    If any local session has new tokens in (baseline_ts, later_ts], or any
+    non-sub-agent turn is open in that interval, the rise is not Type B.
     """
+    open_windows = collect_open_turn_windows(sessions)
     usage_points: list[tuple[datetime, int]] = []
     for st in sessions.values():
         for ev in st.events:
@@ -1658,6 +1896,8 @@ def detect_type_b_global(
                 local = sum(tok for ts, tok in usage_points if earlier.ts < ts <= later.ts)
                 if local > 0:
                     continue
+                if interval_overlaps_open_turn(earlier.ts, later.ts, open_windows):
+                    continue
                 if best is None or step > best[0]:
                     best = (step, earlier, later)
         if best is None:
@@ -1669,8 +1909,9 @@ def detect_type_b_global(
         reason = (
             f"Codex used_percent for limit_id={lid}{name_bit} rose by {step:.1f} "
             f"between {iso(earlier.ts)} and {iso(later.ts)} with no matching new tokens "
-            "on any local session in that interval. Compared globally by limit_id; "
-            "a used_percent change across a resets_at window reset is not counted as growth. "
+            "on any local session in that interval, and no local turn was open. "
+            "Compared globally by limit_id; a used_percent change across a resets_at "
+            "window reset is not counted as growth. "
             "This still cannot see other devices, Codex Cloud, or surfaces that do not write local logs."
         )
         alerts.append(
@@ -1701,147 +1942,330 @@ def detect(
     percent_threshold: float,
     long_run_seconds: int = DEFAULT_LONG_RUN_SECONDS,
 ) -> list[Alert]:
-    """Anchor Type A to the last real user input, in time order.
+    """Detect Type A from post-complete gaps when turn events exist.
 
+    Usage during an open turn (task_started without a matching task_complete,
+    or inside a completed turn's interval) is never idle; it may be long_run.
+    Sessions with no task_started/task_complete keep the user-anchor quiet-gap
+    rule at low confidence and low severity.
     Type B is computed globally by limit_id (see detect_type_b_global).
-    A long stretch of work that follows a user prompt without a quiet gap is
-    not idle_drain. If it lasts at least long_run_seconds, a low-severity
-    long_run alert is emitted instead.
     """
     alerts: list[Alert] = []
     for st in sessions.values():
         if st.is_sidechain:
             continue
-
-        ordered = sorted(st.events, key=_event_sort_key)
-        dated = [ev for ev in ordered if ev.ts is not None and not ev.is_sidechain]
-
-        last_anchor: datetime | None = None
-        last_anchor_type = ""
-        for ev in dated:
-            if ev.kind == "user":
-                last_anchor = ev.ts
-                last_anchor_type = ev.anchor_type
-
-        idle_tokens = 0
-        idle_cache = 0
-        first_idle_ts: datetime | None = None
-        last_idle_ts: datetime | None = None
-        run_tokens = 0
-        run_end: datetime | None = last_anchor
-        outstanding = 0
-
-        for ev in dated:
-            if last_anchor is not None and ev.ts is not None and ev.ts < last_anchor:
-                continue
-            if ev.kind == "user":
-                outstanding = 0
-                run_end = ev.ts
-                continue
-            if ev.kind == "turn_start":
-                # Recorded for explain. The trigger value is not interpreted,
-                # so this does not move the user anchor or the idle clock.
-                continue
-            if ev.kind in {"tool_use", "tool_result"}:
-                outstanding = max(0, outstanding + ev.tool_delta)
-                if ev.ts:
-                    run_end = ev.ts if run_end is None else max(run_end, ev.ts)
-                continue
-            if ev.kind in {"meta", "inherited_user"}:
-                continue
-            if ev.kind == "quota":
-                continue
-            if ev.kind != "usage" or ev.ts is None:
-                continue
-
-            active_until = run_end or last_anchor
-            tool_busy = outstanding > 0
-            quiet = False
-            if not tool_busy and last_anchor is not None and active_until is not None:
-                quiet = (ev.ts - active_until).total_seconds() >= idle_seconds
-            elif last_anchor is None:
-                quiet = False
-
-            if quiet:
-                idle_tokens += ev.tokens
-                idle_cache += ev.cache_read
-                if first_idle_ts is None:
-                    first_idle_ts = ev.ts
-                last_idle_ts = ev.ts
-            else:
-                run_tokens += ev.tokens
-                run_end = ev.ts if run_end is None else max(run_end, ev.ts)
-
-        percent_step, percent_note = _session_percent_step_after_gap(
-            dated, last_anchor, run_end or last_anchor, idle_seconds, percent_threshold
-        )
-
-        has_a = idle_tokens >= token_threshold
-        run_seconds = None
-        if last_anchor is not None and run_end is not None:
-            run_seconds = (run_end - last_anchor).total_seconds()
-        has_long = (
-            run_seconds is not None
-            and run_seconds >= long_run_seconds
-            and run_tokens >= token_threshold
-        )
-
-        if has_a:
-            parts = [
-                f"new tokens grew by {idle_tokens} after a quiet gap of >= {idle_seconds}s "
-                f"from the last real user input (cache_read +{idle_cache} not counted)"
-            ]
-            if last_anchor_type:
-                parts.append(f"anchor type: {last_anchor_type}")
-            if percent_step is not None and percent_step >= percent_threshold:
-                parts.append(
-                    f"Codex {percent_note or 'quota'} used_percent also rose by {percent_step:.1f} during the quiet gap"
-                )
-            if first_idle_ts and last_anchor and first_idle_ts < last_anchor:
-                parts.append("internal warning: first idle timestamp precedes the user anchor")
-            alerts.append(
-                Alert(
-                    severity="medium",
-                    alert_type="A",
-                    session_id=st.session_id,
-                    source=st.source,
-                    path=st.path,
-                    reason="; ".join(parts),
-                    idle_tokens=idle_tokens,
-                    idle_cache_read=idle_cache,
-                    percent_step=percent_step,
-                    last_user_ts=iso(last_anchor),
-                    first_idle_usage_ts=iso(first_idle_ts),
-                    last_usage_ts=iso(last_idle_ts or st.last_usage_ts),
-                    run_seconds=run_seconds,
-                    limit_id=percent_note if percent_note else "",
-                )
+        if st.has_turn_events:
+            alerts.extend(
+                _detect_turn_aware(st, idle_seconds, token_threshold, percent_threshold, long_run_seconds)
             )
-
-        if has_long:
-            alerts.append(
-                Alert(
-                    severity="low",
-                    alert_type="long_run",
-                    session_id=st.session_id,
-                    source=st.source,
-                    path=st.path,
-                    reason=(
-                        f"agent kept working for {int(run_seconds)}s after the last real user input "
-                        f"with no quiet gap of {idle_seconds}s ({run_tokens} new tokens). "
-                        "This is not classified as idle_drain."
-                    ),
-                    idle_tokens=0,
-                    idle_cache_read=0,
-                    percent_step=None,
-                    last_user_ts=iso(last_anchor),
-                    first_idle_usage_ts="",
-                    last_usage_ts=iso(run_end),
-                    run_seconds=run_seconds,
+        else:
+            alerts.extend(
+                _detect_user_anchor_fallback(
+                    st, idle_seconds, token_threshold, percent_threshold, long_run_seconds
                 )
             )
 
     alerts.extend(detect_type_b_global(sessions, idle_seconds, percent_threshold))
+    return alerts
+
+
+def _detect_turn_aware(
+    st: SessionState,
+    idle_seconds: int,
+    token_threshold: int,
+    percent_threshold: float,
+    long_run_seconds: int,
+) -> list[Alert]:
+    ordered = sorted(st.events, key=_event_sort_key)
+    dated = [ev for ev in ordered if ev.ts is not None]
+    turns = st.turns
+    alerts: list[Alert] = []
+
+    idle_tokens = 0
+    idle_cache = 0
+    first_idle_ts: datetime | None = None
+    last_idle_ts: datetime | None = None
+    post_ids: list[str] = []
+    # Quiet clock per inter-turn gap, keyed by the complete timestamp that opened it.
+    gap_cursor: dict[datetime, datetime] = {}
+
+    for ev in dated:
+        if ev.kind != "usage" or ev.is_sidechain:
+            continue
+        kind = classify_usage_against_turns(ev, turns)
+        if kind not in {"post_complete", "inter_gap"}:
+            continue
+        complete_ts = None
+        ids = _turn_ids_of(ev)
+        if kind == "post_complete" and ids:
+            ends = [
+                t.end_ts
+                for t in turns
+                if t.turn_id in ids and t.completed and t.end_ts is not None and ev.ts > t.end_ts
+            ]
+            if ends:
+                complete_ts = max(ends)
+                post_ids.extend(sorted(ids))
+        if complete_ts is None:
+            complete_ts = _latest_complete_before(turns, ev.ts)
+        if complete_ts is None:
+            continue
+        boundary = _next_start_or_user(dated, complete_ts)
+        if boundary is not None and ev.ts >= boundary:
+            continue
+        cursor = gap_cursor.get(complete_ts, complete_ts)
+        if (ev.ts - cursor).total_seconds() < idle_seconds:
+            # Residual activity shortly after complete; move the quiet clock.
+            gap_cursor[complete_ts] = ev.ts
+            continue
+        idle_tokens += ev.tokens
+        idle_cache += ev.cache_read
+        if first_idle_ts is None:
+            first_idle_ts = ev.ts
+        last_idle_ts = ev.ts
+        gap_cursor[complete_ts] = ev.ts
+
+    percent_step, percent_note = _session_percent_step_after_gap(
+        [e for e in dated if not e.is_sidechain],
+        first_idle_ts or st.last_user_ts,
+        first_idle_ts,
+        0,
+        percent_threshold,
+    ) if first_idle_ts is not None else (None, "")
+
+    if idle_tokens >= token_threshold and first_idle_ts is not None:
+        id_note = ""
+        uniq = []
+        for i in post_ids:
+            if i not in uniq:
+                uniq.append(i)
+        if uniq:
+            id_note = f"; turn_id {', '.join(uniq)} pointed at a completed turn"
+        parts = [
+            f"new tokens grew by {idle_tokens} after a task_complete, "
+            f"with a quiet gap of >= {idle_seconds}s before the next task_started "
+            f"or user input (cache_read +{idle_cache} not counted){id_note}"
+        ]
+        if st.last_anchor_type:
+            parts.append(f"anchor type: {st.last_anchor_type}")
+        if percent_step is not None and percent_step >= percent_threshold:
+            parts.append(
+                f"Codex {percent_note or 'quota'} used_percent also rose by {percent_step:.1f} during the quiet gap"
+            )
+        alerts.append(
+            Alert(
+                severity="medium",
+                alert_type="A",
+                session_id=st.session_id,
+                source=st.source,
+                path=st.path,
+                reason="; ".join(parts),
+                idle_tokens=idle_tokens,
+                idle_cache_read=idle_cache,
+                percent_step=percent_step,
+                last_user_ts=iso(st.last_user_ts),
+                first_idle_usage_ts=iso(first_idle_ts),
+                last_usage_ts=iso(last_idle_ts or st.last_usage_ts),
+                limit_id=percent_note if percent_note else "",
+                confidence="high",
+            )
+        )
+
+    # long_run: any non-sub-agent turn that stayed in work long enough.
+    best_secs = 0.0
+    best_tokens = 0
+    best_end: datetime | None = None
+    best_start: datetime | None = None
+    best_id = ""
+    for turn in turns:
+        if turn.is_subagent or turn.start_ts is None:
+            continue
+        in_turn_usage = [
+            e
+            for e in dated
+            if e.kind == "usage"
+            and not e.is_sidechain
+            and classify_usage_against_turns(e, [turn]) in {"in_turn", "open_turn"}
+        ]
+        last_u = max((e.ts for e in in_turn_usage if e.ts), default=None)
+        end = turn.end_ts or last_u
+        if end is None:
+            continue
+        secs = (end - turn.start_ts).total_seconds()
+        toks = sum(e.tokens for e in in_turn_usage)
+        if secs >= long_run_seconds and toks >= token_threshold and secs >= best_secs:
+            best_secs = secs
+            best_tokens = toks
+            best_end = end
+            best_start = turn.start_ts
+            best_id = turn.turn_id
+    if best_secs >= long_run_seconds and best_tokens >= token_threshold:
+        tid = f" turn_id={best_id}" if best_id else ""
+        state = "until task_complete" if any(
+            t.turn_id == best_id and t.completed for t in turns
+        ) else "while the turn stayed open"
+        alerts.append(
+            Alert(
+                severity="low",
+                alert_type="long_run",
+                session_id=st.session_id,
+                source=st.source,
+                path=st.path,
+                reason=(
+                    f"agent kept working for {int(best_secs)}s after task_started{tid} "
+                    f"{state} ({best_tokens} new tokens). "
+                    "This is not classified as idle_drain."
+                ),
+                idle_tokens=0,
+                idle_cache_read=0,
+                percent_step=None,
+                last_user_ts=iso(st.last_user_ts),
+                first_idle_usage_ts="",
+                last_usage_ts=iso(best_end),
+                run_seconds=best_secs,
+                confidence="high",
+            )
+        )
+    return alerts
+
+
+def _detect_user_anchor_fallback(
+    st: SessionState,
+    idle_seconds: int,
+    token_threshold: int,
+    percent_threshold: float,
+    long_run_seconds: int,
+) -> list[Alert]:
+    """Sessions with no task_started/task_complete: previous user-anchor rule, low confidence."""
+    ordered = sorted(st.events, key=_event_sort_key)
+    dated = [ev for ev in ordered if ev.ts is not None and not ev.is_sidechain]
+    alerts: list[Alert] = []
+
+    last_anchor: datetime | None = None
+    last_anchor_type = ""
+    for ev in dated:
+        if ev.kind == "user":
+            last_anchor = ev.ts
+            last_anchor_type = ev.anchor_type
+
+    idle_tokens = 0
+    idle_cache = 0
+    first_idle_ts: datetime | None = None
+    last_idle_ts: datetime | None = None
+    run_tokens = 0
+    run_end: datetime | None = last_anchor
+    outstanding = 0
+
+    for ev in dated:
+        if last_anchor is not None and ev.ts is not None and ev.ts < last_anchor:
+            continue
+        if ev.kind == "user":
+            outstanding = 0
+            run_end = ev.ts
+            continue
+        if ev.kind in {"turn_start", "turn_end"}:
+            continue
+        if ev.kind in {"tool_use", "tool_result"}:
+            outstanding = max(0, outstanding + ev.tool_delta)
+            if ev.ts:
+                run_end = ev.ts if run_end is None else max(run_end, ev.ts)
+            continue
+        if ev.kind in {"meta", "inherited_user", "quota"}:
+            continue
+        if ev.kind != "usage" or ev.ts is None:
+            continue
+
+        active_until = run_end or last_anchor
+        tool_busy = outstanding > 0
+        quiet = False
+        if not tool_busy and last_anchor is not None and active_until is not None:
+            quiet = (ev.ts - active_until).total_seconds() >= idle_seconds
+        elif last_anchor is None:
+            quiet = False
+
+        if quiet:
+            idle_tokens += ev.tokens
+            idle_cache += ev.cache_read
+            if first_idle_ts is None:
+                first_idle_ts = ev.ts
+            last_idle_ts = ev.ts
+        else:
+            run_tokens += ev.tokens
+            run_end = ev.ts if run_end is None else max(run_end, ev.ts)
+
+    percent_step, percent_note = _session_percent_step_after_gap(
+        dated, last_anchor, run_end or last_anchor, idle_seconds, percent_threshold
+    )
+
+    has_a = idle_tokens >= token_threshold
+    run_seconds = None
+    if last_anchor is not None and run_end is not None:
+        run_seconds = (run_end - last_anchor).total_seconds()
+    has_long = (
+        run_seconds is not None
+        and run_seconds >= long_run_seconds
+        and run_tokens >= token_threshold
+    )
+
+    if has_a:
+        parts = [
+            f"new tokens grew by {idle_tokens} after a quiet gap of >= {idle_seconds}s "
+            f"from the last real user input (cache_read +{idle_cache} not counted)",
+            "low confidence: no task_started/task_complete in this session; "
+            "used the user-anchor quiet-gap fallback",
+        ]
+        if last_anchor_type:
+            parts.append(f"anchor type: {last_anchor_type}")
+        if percent_step is not None and percent_step >= percent_threshold:
+            parts.append(
+                f"Codex {percent_note or 'quota'} used_percent also rose by {percent_step:.1f} during the quiet gap"
+            )
+        if first_idle_ts and last_anchor and first_idle_ts < last_anchor:
+            parts.append("internal warning: first idle timestamp precedes the user anchor")
+        alerts.append(
+            Alert(
+                severity="low",
+                alert_type="A",
+                session_id=st.session_id,
+                source=st.source,
+                path=st.path,
+                reason="; ".join(parts),
+                idle_tokens=idle_tokens,
+                idle_cache_read=idle_cache,
+                percent_step=percent_step,
+                last_user_ts=iso(last_anchor),
+                first_idle_usage_ts=iso(first_idle_ts),
+                last_usage_ts=iso(last_idle_ts or st.last_usage_ts),
+                run_seconds=run_seconds,
+                limit_id=percent_note if percent_note else "",
+                confidence="low",
+            )
+        )
+
+    if has_long:
+        alerts.append(
+            Alert(
+                severity="low",
+                alert_type="long_run",
+                session_id=st.session_id,
+                source=st.source,
+                path=st.path,
+                reason=(
+                    f"agent kept working for {int(run_seconds)}s after the last real user input "
+                    f"with no quiet gap of {idle_seconds}s ({run_tokens} new tokens). "
+                    "This is not classified as idle_drain. "
+                    "low confidence: no task_started/task_complete in this session."
+                ),
+                idle_tokens=0,
+                idle_cache_read=0,
+                percent_step=None,
+                last_user_ts=iso(last_anchor),
+                first_idle_usage_ts="",
+                last_usage_ts=iso(run_end),
+                run_seconds=run_seconds,
+                confidence="low",
+            )
+        )
     return alerts
 
 
@@ -1871,6 +2295,9 @@ class ScanSummary:
     min_severity: str
     thresholds: dict[str, int | float]
     zstd_backend: str | None
+    turns_total: int = 0
+    turns_completed: int = 0
+    post_complete_usage_events: int = 0
 
 
 @dataclass
@@ -1923,6 +2350,9 @@ def _build_summary(
             "long_run_seconds": long_run_seconds,
         },
         zstd_backend=zstd_backend(),
+        turns_total=sum(len(st.turns) for st in sessions.values()),
+        turns_completed=sum(1 for st in sessions.values() for tr in st.turns if tr.completed),
+        post_complete_usage_events=sum(st.post_complete_usage_events for st in sessions.values()),
     )
 
 
@@ -2040,6 +2470,15 @@ def format_summary_lines(summary: ScanSummary) -> list[str]:
             )
             + ")."
         ),
+        (
+            f"Turns: {summary.turns_total} total, {summary.turns_completed} with task_complete"
+            + (
+                f" ({(100 * summary.turns_completed / summary.turns_total):.0f}%)"
+                if summary.turns_total
+                else ""
+            )
+            + f"; post-complete usage events: {summary.post_complete_usage_events}."
+        ),
         f"Alerts: {alert_bits} (shown: {summary.alerts_shown}{hidden}).",
         (
             f"Thresholds: idle {summary.thresholds['idle_seconds']}s, "
@@ -2076,6 +2515,8 @@ def _timeline_lines(st: SessionState, *, anchor: datetime | None = None) -> list
             lines.append(f"  - {ts}  inherited_user  (not an anchor; inherited_user_message=true)")
         elif ev.kind == "turn_start":
             extra = []
+            if ev.turn_id:
+                extra.append(f"turn_id={ev.turn_id}")
             if ev.turn_trigger:
                 extra.append(f"turn_trigger={ev.turn_trigger}")
             if ev.initiating_agent_path:
@@ -2084,14 +2525,28 @@ def _timeline_lines(st: SessionState, *, anchor: datetime | None = None) -> list
                 extra.append("sub-agent turn; excluded from idle detection")
             suffix = ("  " + " ".join(extra)) if extra else ""
             lines.append(f"  - {ts}  task_started{suffix}")
+        elif ev.kind == "turn_end":
+            extra = []
+            if ev.turn_id:
+                extra.append(f"turn_id={ev.turn_id}")
+            if ev.root_turn_id and ev.root_turn_id != ev.turn_id:
+                extra.append(f"root_turn_id={ev.root_turn_id}")
+            if ev.is_sidechain:
+                extra.append("sub-agent turn; excluded from idle detection")
+            suffix = ("  " + " ".join(extra)) if extra else ""
+            lines.append(f"  - {ts}  task_complete{suffix}")
         elif ev.kind == "tool_result":
             lines.append(f"  - {ts}  tool_result  (not a user anchor; tool_delta={ev.tool_delta})")
         elif ev.kind == "tool_use":
             lines.append(f"  - {ts}  tool_use  (tool_delta=+{ev.tool_delta})")
         elif ev.kind == "usage":
-            lines.append(
-                f"  - {ts}  usage  new_tokens=+{ev.tokens}  cache_read=+{ev.cache_read}"
-            )
+            bits = [f"new_tokens=+{ev.tokens}", f"cache_read=+{ev.cache_read}"]
+            if ev.turn_id:
+                bits.append(f"turn_id={ev.turn_id}")
+            status = classify_usage_against_turns(ev, st.turns) if st.turns else ""
+            if status in {"post_complete", "inter_gap"}:
+                bits.append("post-complete")
+            lines.append(f"  - {ts}  usage  {' '.join(bits)}")
         elif ev.kind == "quota":
             label = ev.window_label or "quota"
             pct = ev.used_percent
@@ -2138,6 +2593,9 @@ def render_explain(
         f"- Anchor type: {st.last_anchor_type or ('real user input' if st.last_user_ts else 'none — ' + (st.no_anchor_reason or 'unknown'))}",
         f"- New tokens (input+output+cache_creation): {st.total_tokens}",
         f"- cache_read (not counted in idle increment): {st.total_cache_read}",
+        f"- Turns: {len(st.turns)} total, {sum(1 for tr in st.turns if tr.completed)} with task_complete",
+        f"- Post-complete usage events: {st.post_complete_usage_events}",
+        f"- Turn events present: {'yes' if st.has_turn_events else 'no (user-anchor fallback, low confidence)'}",
         "",
     ]
     lines += _timeline_lines(st, anchor=st.last_user_ts)
@@ -2176,7 +2634,10 @@ def render_report(
         "Generated locally by quota-guard. This is **not** an official quota dashboard.",
         "New-token totals use input + output + cache_creation (plus Codex reasoning when present).",
         "cache_read / cached_input_tokens are listed separately and are not added to idle increments.",
-        "Idle detection is anchored to the last real user input in timestamp order.",
+        "Type A on logs with task_started/task_complete is post-complete usage after a quiet gap,",
+        "not merely time since the last user prompt. Open-turn usage may be long_run, never idle_drain.",
+        "Sessions without those turn events (Claude or older Codex) use the user-anchor quiet-gap rule",
+        "at low confidence and low severity (hidden unless --min-severity low).",
         "Codex `used_percent` values come from snapshots the official client wrote into local logs; they may lag.",
         "No account credentials were read. No provider API was called.",
         "",
@@ -2246,10 +2707,11 @@ def render_report(
         lines.append("")
 
     type_note = {
-        "A": "Type A — new tokens grew after a quiet gap following the last real user input.",
+        "A": "Type A — new tokens grew after a task_complete, in a quiet gap before the next turn start (or, without turn events, after the last user input at low confidence).",
         "B": (
             "Type B — quota percent rose for a limit_id, compared across all local sessions, "
-            "with no matching new-token delta on any of them in that interval. "
+            "with no matching new-token delta on any of them in that interval, "
+            "and with no local turn open. "
             "Window resets (a change in resets_at) are not counted as growth. "
             "This still cannot see other devices, Codex Cloud, or surfaces that do not write local logs."
         ),
@@ -2821,6 +3283,9 @@ def _summary_dict(summary: ScanSummary) -> dict[str, Any]:
         "min_severity": summary.min_severity,
         "thresholds": summary.thresholds,
         "zstd_backend": summary.zstd_backend,
+        "turns_total": summary.turns_total,
+        "turns_completed": summary.turns_completed,
+        "post_complete_usage_events": summary.post_complete_usage_events,
     }
 
 

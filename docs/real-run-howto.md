@@ -78,7 +78,9 @@ An idle-drain alert looks like this (session id hashed unless you pass `--no-has
         first post-gap usage: 2026-11-10T01:04:10+00:00
 ```
 
-Type B (quota percent moved, no local new tokens) is compared by `limit_id` across all local sessions. A `resets_at` window reset is not counted as growth, and activity in any other local session on the same pool suppresses the alert. The report still notes that other devices, Codex Cloud, or surfaces that do not write local logs are invisible. That is a limitation of local logs, not a proof of a billing error.
+Type A on current Codex logs is **post-complete** usage after a quiet gap, not “the last user prompt was a long time ago.” An agent that keeps working in the same turn will not be Type A; it may be `long_run`. Sessions without `task_started`/`task_complete` (Claude or older Codex) still use the user-anchor rule, at low confidence and low severity (hidden by default).
+
+Type B (quota percent moved, no local new tokens) is compared by `limit_id` across all local sessions, and only in intervals where no local turn is open. A `resets_at` window reset is not counted as growth, and activity in any other local session on the same pool suppresses the alert. The report still notes that other devices, Codex Cloud, or surfaces that do not write local logs are invisible. That is a limitation of local logs, not a proof of a billing error.
 
 The summary classifies sessions with **no real user input** as `no user messages`, `all inherited`, or `sub-agent`. `--explain` prints the user-input **anchor type** (`client_authored=true`, `fallback_role_user`, or the older `event_msg/user_message`) without prompt text. Malformed or non-JSON lines in one file are reported as a single "N lines skipped" warning, not one line per record.
 

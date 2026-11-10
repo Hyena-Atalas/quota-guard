@@ -223,7 +223,10 @@ class TestDiscoveryAndAliases(unittest.TestCase):
         self.assertEqual(proc.returncode, 2, msg=proc.stderr + proc.stdout)
         payload = json.loads(proc.stdout)
         self.assertEqual(payload["sessions"], 4)
-        self.assertEqual(len(payload["alerts"]), 3)
+        # Default --min-severity medium hides low-confidence Type A (no task_* events).
+        self.assertEqual({a["alert_type"] for a in payload["alerts"]}, {"B"})
+        self.assertEqual(payload["summary"]["alerts_by_type"].get("A"), 2)
+        self.assertEqual(payload["summary"]["alerts_by_type"].get("B"), 1)
 
     def test_comma_separated_claude_config_dir(self) -> None:
         env = {
@@ -402,7 +405,7 @@ class TestCLI(unittest.TestCase):
     def test_version(self) -> None:
         proc = run_cli(["--version"])
         self.assertEqual(proc.returncode, 0, msg=proc.stderr)
-        self.assertIn("0.3.0", proc.stdout)
+        self.assertIn("0.4.0", proc.stdout)
 
     def test_default_subcommand_is_scan(self) -> None:
         with_scan = run_cli(
@@ -425,6 +428,8 @@ class TestCLI(unittest.TestCase):
                 str(CODEX),
                 "--idle-seconds",
                 "180",
+                "--min-severity",
+                "low",
                 "--json",
                 "--no-hash",
                 "--no-redact-home",
@@ -433,6 +438,8 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(proc.returncode, 2, msg=proc.stderr + proc.stdout)
         payload = json.loads(proc.stdout)
         by_id = {a["session_id"]: a for a in payload["alerts"]}
+        self.assertEqual(by_id["sess-idle"]["confidence"], "low")
+        self.assertEqual(by_id["sess-idle"]["severity"], "low")
         self.assertEqual(by_id["sess-idle"]["idle_tokens"], 750)
         self.assertEqual(by_id["sess-idle"]["idle_cache_read"], 50000)
         self.assertEqual(by_id["sess-codex-idle"]["idle_tokens"], 1100)

@@ -301,10 +301,10 @@ class TestExplainAndSummary(unittest.TestCase):
 
 
 class TestVersion(unittest.TestCase):
-    def test_version_is_0_3_0(self) -> None:
+    def test_version_is_0_4_0(self) -> None:
         proc = run_cli(["--version"])
         self.assertEqual(proc.returncode, 0)
-        self.assertIn("0.3.0", proc.stdout)
+        self.assertIn("0.4.0", proc.stdout)
 
 
 if __name__ == "__main__":
