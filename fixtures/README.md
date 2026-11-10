@@ -8,5 +8,6 @@ Every file under this directory is a **constructed sample**. None of it is a rea
 - `regression/codex-modern/` — constructed current Codex rollout shape (`response_item` user messages, `client_authored` / `inherited_user_message`, `task_started`, `token_usage_record`, `limit_id` / `resets_at`, sub-agent turns, and mid-file non-JSON lines). No real transcripts.
 - `regression/codex-turns/` — turn-state detection: a 2-hour in-turn run (not Type A, only long_run), post-complete `token_usage_record` (Type A), older logs with no `task_*` (low-confidence Type A), and Type B with an open vs completed turn.
 - `config/` — read-only `check-config` samples
+- `secrets/` — constructed agent-config samples for the unreleased `secrets` / `doctor` subcommands: `leaky/`, `clean/`, `false-positives/`, and `ssh/`. Values are fake placeholders only (`NOTREAL` / example prefixes), never production credentials.
 
 Do not add real transcripts here.

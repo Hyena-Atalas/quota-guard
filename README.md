@@ -103,7 +103,7 @@ Custom roots work on Windows and POSIX because paths are handled with `pathlib`.
 - macOS Keychain, browser cookies, or OAuth tokens
 - Official usage HTTP endpoints, including unofficial community usage APIs
 - `logs_2.sqlite` (out of scope for this version)
-- Source files in your project directories (it only opens the log/config paths above)
+- Source files in your project directories (the default `scan` / `report` / `check-config` commands only open the log/config paths above; the unreleased `secrets` command additionally reads agent config files listed in the section below, never `auth.json` or SSH private keys)
 
 If a credentials-like filename appears next to logs, it is skipped on purpose.
 
@@ -174,6 +174,35 @@ quota-guard does **not** read Keychain or call unofficial usage APIs the way som
 Please do not attach original session files that contain source code, prompts, or secrets.
 
 If you are the person publishing this repository, say so in community posts. Draft wording (still drafts, not published from this repo) is in [`docs/post-drafts.md`](docs/post-drafts.md).
+
+## Unreleased on this branch (`secrets-scan`)
+
+This section documents local-only work. It is **not** on the public default branch, and it has not been announced in existing posts.
+
+`usage` is an alias of `scan`. `secrets` audits AI coding-agent config files for leaked secrets. `doctor` runs a usage scan and a secrets audit and writes one combined report.
+
+```bash
+python3 quota_guard.py secrets --root ./fixtures/secrets/leaky --report ./examples/sample-secrets-report.md
+python3 quota_guard.py secrets --print-gitignore
+python3 quota_guard.py doctor \
+  --claude-root ./fixtures/claude \
+  --codex-root ./fixtures/codex \
+  --root ./fixtures/secrets/leaky \
+  --ssh-config ./fixtures/secrets/ssh/config \
+  --report ./examples/sample-doctor-report.md
+```
+
+`secrets` is still read-only, uses the standard library only, and makes no network requests (git checks are local). It does **not** read `auth.json`, `.credentials.json`, Keychain, or `~/.ssh/id_*` private keys. Session JSONL transcripts are not scanned by default.
+
+Every secret finding is redacted: the report includes the file path, line number, rule id, and a snippet of the form `ab*** (len=N)` (or `*** (len=N)` when the value is two characters or shorter). The raw secret is never printed or written to the report. If a value was ever committed, rotate it first; deleting the file is not enough.
+
+Paths scanned when you pass `--root` (project) or `--home` (optional user directory):
+
+- `.claude/settings.json`, `.claude/settings.local.json`
+- `.mcp.json`, `.codex/config.toml`, `.cursor/mcp.json`, `.cursor/permissions.json`, `.cursor/sandbox.json`
+- `.gemini/settings.json`, `.vscode/mcp.json`, `CLAUDE.md`, `AGENTS.md`, `.cursorrules`
+- With `--home`: the same kind of files under `$HOME`, plus `~/.ssh/config` for `ForwardAgent yes` (config only; this cannot prove a running app is forwarding the agent)
+- Git hygiene: whether `settings.local.json` is in the project's `.gitignore`, whether sensitive agent files are tracked, and whether they still appear in `git log --all`
 
 ## License
 
