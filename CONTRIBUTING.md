@@ -10,6 +10,8 @@ Thanks for taking a look. This project is a **read-only** local log scanner. Ple
 - Do not commit real user logs. JSONL often contains source code, prompts, and secrets. Tests and fixtures must stay **constructed samples**.
 - Do not invent official default values or undocumented settings keys. If something is not confirmed, label it unconfirmed and skip it with a warning rather than crashing.
 - Reports must not include prompt text. Session ids are hashed unless the caller passes `--no-hash`.
+- The `secrets` scanner may read agent config files that contain passwords, but it must never print, store, or write the raw secret. Reports may include only the file path, line number, rule id, and a redacted snippet (first two characters + `***`, or `***` for values of length 2 or less). Tests must assert that fixture raw values do not appear in JSON, markdown, or CLI output.
+- Do not add network calls or online "is this secret still valid?" checks.
 
 ## Development
 

@@ -3,14 +3,14 @@
 **Waitlist:** [join here](https://docs.google.com/forms/d/e/1FAIpQLSdAGJXUIATq7lv0Au0DtOY84om0Mwnlhi-JDqXmHhhQVGZH9g/viewform)
 
 
-Free, open-source, **read-only** CLI that inspects **local** Claude Code and Codex CLI session logs for a simple pattern: token counts or Codex quota percentages that keep moving after you have not entered a prompt for a while.
+Free, open-source, **read-only** CLI for local Claude Code and Codex CLI data. It looks at session logs for a simple usage pattern: token counts or Codex quota percentages that keep moving after you have not entered a prompt for a while. It can also audit local agent-config files for leaked secrets (`secrets`) and run both checks together (`doctor`).
 
 It is **not an official quota dashboard**. It does not contact OpenAI or Anthropic, does not read credentials, and does not upload your logs. It does **not** guarantee that anyone will refund or restore usage. [OpenAI Support will not reset](https://help.openai.com/en/articles/11369540-using-codex-with-your-chatgpt-plan) ChatGPT/Codex usage limits. If you contact Support, treat the markdown timeline as extra local evidence for an investigation, not as a claim that quota will come back.
 
 ## What this is (and is not)
 
 - **Free** MIT-licensed CLI. No account, no telemetry in this repository.
-- **Read-only local files.** JSONL session logs, plus (for `check-config` only) `config.toml` / `settings.json`.
+- **Read-only local files.** JSONL session logs, `config.toml` / `settings.json` for `check-config`, and agent-config files for `secrets` (see below).
 - **No credentials.** It will not open `auth.json`, `.credentials.json`, Keychain, or cookies, and it will not call unused or unofficial usage APIs.
 - **No network.** A scan does not make HTTP requests. Doc links in the output are for you to open.
 - **No process control.** It will not kill or interrupt `claude` or `codex`.
@@ -19,6 +19,8 @@ It is **not an official quota dashboard**. It does not contact OpenAI or Anthrop
 ## Validation so far
 
 I have run quota-guard on my own real local Claude Code and Codex session logs, not only on the constructed fixtures in this repository. So far it has **not** flagged a confirmed idle-drain event on those logs. A report from this tool is a local timeline of counts and timestamps. It is a clue, not proof that official billing is wrong.
+
+I have also run `secrets` on my own Mac against real local agent-config files. So far it has flagged **0** findings on those files.
 
 ## Install and run
 
@@ -42,10 +44,12 @@ Scan the default local roots (`$CLAUDE_CONFIG_DIR` or `~/.claude`, and `$CODEX_H
 python3 quota_guard.py scan
 python3 quota_guard.py report --report ./evidence.md
 python3 quota_guard.py check-config
+python3 quota_guard.py secrets --root .
+python3 quota_guard.py doctor
 python3 quota_guard.py --version
 ```
 
-`scan` is the default subcommand, so `python3 quota_guard.py --idle-seconds 180` is the same as `scan`.
+`scan` is the default subcommand, so `python3 quota_guard.py --idle-seconds 180` is the same as `scan`. `usage` is an alias of `scan`.
 
 Point the tool at the constructed samples in this repository (these are **not** real user sessions):
 
@@ -89,6 +93,7 @@ Only these, and only as files, never as a login:
 | Claude Code | `$CLAUDE_CONFIG_DIR` or `~/.claude` | `projects/**/*.jsonl`, recursively, including `subagents/` |
 | Codex CLI | `$CODEX_HOME` or `~/.codex` (Windows: `%USERPROFILE%\.codex`) | `sessions/**/rollout-*.jsonl` and `archived_sessions/**/rollout-*.jsonl`, including `.jsonl.zst` |
 | `check-config` only | same roots | `~/.codex/config.toml` and `~/.claude/settings.json` |
+| `secrets` / `doctor` | `--root` (default: current directory); optional `--home` | Agent-config files listed in [Secrets and doctor](#secrets-and-doctor). Not session JSONL, and not `auth.json` / SSH private keys |
 
 `CLAUDE_CONFIG_DIR` may be a comma-separated list. Some community tools report that behavior; whether it is official complete behavior is **unverified**. This tool does **not** automatically also scan `~/.config/claude`.
 
@@ -103,7 +108,7 @@ Custom roots work on Windows and POSIX because paths are handled with `pathlib`.
 - macOS Keychain, browser cookies, or OAuth tokens
 - Official usage HTTP endpoints, including unofficial community usage APIs
 - `logs_2.sqlite` (out of scope for this version)
-- Source files in your project directories (it only opens the log/config paths above)
+- Source files in your project directories (`scan` / `report` / `check-config` only open the log/config paths above; `secrets` additionally reads the agent-config files listed below, never `auth.json` or SSH private keys)
 
 If a credentials-like filename appears next to logs, it is skipped on purpose.
 
@@ -140,8 +145,9 @@ JSONL files often contain source code, prompts, and secrets. By default the repo
 - **hashed** session ids (`sha256:` plus 12 hex characters; pass `--no-hash` to turn this off). If a file path contains the same id, that substring is replaced too
 - redacted file paths (your home directory becomes `~`; pass `--no-redact-home` to turn this off)
 - configuration **key names** and the values of a short documented list, for `check-config`
+- for `secrets`: file path, line number, rule id, and a redacted snippet only (never the raw secret)
 
-The tool never writes prompt text or message bodies into the report. Please do not upload raw JSONL when you file an issue.
+The tool never writes prompt text or message bodies into the report. Please do not upload raw JSONL, and do not paste unredacted `settings.local.json` or other config files, when you file an issue.
 
 ## Config check
 
@@ -170,10 +176,54 @@ quota-guard does **not** read Keychain or call unofficial usage APIs the way som
 - Issues: `https://github.com/Hyena-Atalas/quota-guard/issues`
   - “I caught an idle-drain event” — please send a **redacted** timeline only
   - “I ran it successfully” — install/run feedback, including whether timestamps roughly line up with `/usage` or `/status`
+  - A redacted secrets finding on your own machine (file, line, rule, and redacted snippet only)
 
-Please do not attach original session files that contain source code, prompts, or secrets.
+Please do not attach original session files that contain source code, prompts, or secrets. Please do not paste unredacted agent-config files.
 
 If you are the person publishing this repository, say so in community posts. Draft wording (still drafts, not published from this repo) is in [`docs/post-drafts.md`](docs/post-drafts.md).
+
+## Secrets and doctor
+
+`secrets` is a read-only, local audit of AI coding-agent config files. It does not read credentials (`auth.json`, `.credentials.json`, Keychain, or `~/.ssh/id_*` private keys), does not upload anything, and does not make network requests (git checks, if any, are local). Session JSONL transcripts are not scanned by default.
+
+The report includes only the **file path**, **line number**, **rule id**, and a **redacted snippet** of the form `ab*** (len=N)` (or `*** (len=N)` when the value is two characters or shorter). The raw secret is never printed or written to the report. If a value was ever committed, rotate it first; deleting the file is not enough.
+
+`doctor` runs a usage scan and a secrets audit and can write one combined report. `usage` is an alias of `scan`.
+
+```bash
+python3 quota_guard.py secrets --root . --report ./secrets-report.md
+python3 quota_guard.py secrets --print-gitignore
+python3 quota_guard.py secrets --print-hook
+python3 quota_guard.py doctor \
+  --claude-root ./fixtures/claude \
+  --codex-root ./fixtures/codex \
+  --root ./fixtures/secrets/leaky \
+  --ssh-config ./fixtures/secrets/ssh/config
+```
+
+Paths scanned when you pass `--root` (project) or `--home` (optional user directory):
+
+- `.claude/settings.json`, `.claude/settings.local.json`
+- `.mcp.json`, `.codex/config.toml`, `.cursor/mcp.json`, `.cursor/permissions.json`, `.cursor/sandbox.json`
+- `.gemini/settings.json`, `.vscode/mcp.json`, `CLAUDE.md`, `AGENTS.md`, `.cursorrules`
+- With `--home`: the same kind of files under `$HOME`, plus `~/.ssh/config` for `ForwardAgent yes` (config only; this cannot prove a running app is forwarding the agent)
+- Git hygiene: whether `settings.local.json` is in the project's `.gitignore`, whether sensitive agent files are tracked, and whether they still appear in `git log --all`
+
+Recursive discovery skips `node_modules`, `.git`, `vendor`, `.venv`, `venv`, `dist`, `build`, `target`, and similar directories by default, so a third-party package's own `.claude/settings.local.json` is not treated as yours. Pass `--include-deps` to scan them anyway.
+
+If zstd support is missing, `scan` / `usage` / `report` / `doctor` print one summary line for skipped `.jsonl.zst` files and suggest `pip install zstandard`. Pass `--verbose` to list each file.
+
+### Comparison with gitleaks and TruffleHog
+
+The comparison below was run only on **constructed fake fixtures** in this repository (including `fixtures/secrets/leaky-highentropy/`). It has not been measured on a corpus of real leaked files. Tools: gitleaks **8.30.1** and TruffleHog **3.99.8**, default rules, no online verification.
+
+- `sshpass -p` and `mysql -pSECRET` in a Claude allow rule: **both tools missed** these on the constructed fixtures.
+- `PGPASSWORD=`: gitleaks caught a high-entropy constructed value as `generic-api-key`; TruffleHog missed it. The low-entropy placeholder in `fixtures/secrets/leaky/` was missed by both (gitleaks' `generic-api-key` rule has an entropy threshold and a `fake` stopword).
+- A format-correct constructed `ghp_` token: **both tools caught it** (as `github-pat` / `Github`), including when it sat in an `Authorization: Bearer` allow rule. They matched the token format, not a Bearer-header rule.
+
+On my own Mac, a `secrets` run against real local agent-config files flagged **0** findings. That is a result on one machine, not a claim that the tool is complete or that those files are proven clean.
+
+The commands and tables are in [`docs/secrets-scanner-comparison.md`](docs/secrets-scanner-comparison.md).
 
 ## License
 

@@ -36,4 +36,4 @@ Homepage = "<REPO_URL>"
 Issues = "<REPO_URL>/issues"
 
 [tool.setuptools]
-py-modules = ["quota_guard"]
+py-modules = ["quota_guard", "secrets_scan"]

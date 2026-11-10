@@ -6,6 +6,10 @@ Reads Claude Code JSONL transcripts and Codex CLI rollout JSONL files
 or quota-percent growth in a quiet gap after a turn has completed
 (task_complete), not merely because the last user prompt was a while ago.
 
+Optional unreleased subcommands on this branch: `usage` (alias of `scan`),
+`secrets` (agent-config secret audit), and `doctor` (usage + secrets).
+Secret reports never print raw secret values.
+
 This tool does NOT read credentials, call provider APIs, or kill processes.
 Unknown or incomplete log records are skipped with a warning; they do not
 crash the scan.
@@ -2427,9 +2431,39 @@ def scan_roots(
     return ScanResult(events, sessions, alerts, scanned, skipped, warnings, summary)
 
 
-def emit_warnings(warnings: list[ParseWarning], stream: TextIO = sys.stderr) -> None:
-    for w in warnings:
-        print(f"warning: {w}", file=stream)
+def is_zst_unsupported_warning(warning: ParseWarning) -> bool:
+    return "zst unsupported" in warning.message
+
+
+def format_emitted_warnings(warnings: list[ParseWarning], *, verbose: bool = False) -> list[str]:
+    """Format warnings for stderr. Collapse zst-unsupported skips unless verbose."""
+    lines: list[str] = []
+    zst = [w for w in warnings if is_zst_unsupported_warning(w)]
+    others = [w for w in warnings if not is_zst_unsupported_warning(w)]
+    if zst and not verbose:
+        n = len(zst)
+        noun = "file" if n == 1 else "files"
+        lines.append(
+            f"warning: skipped {n} .jsonl.zst {noun} because zstd support is unavailable. "
+            "Install with: pip install zstandard (Python 3.14+ also provides compression.zstd). "
+            "Re-run with --verbose to list each file."
+        )
+    else:
+        for w in zst:
+            lines.append(f"warning: {w}")
+    for w in others:
+        lines.append(f"warning: {w}")
+    return lines
+
+
+def emit_warnings(
+    warnings: list[ParseWarning],
+    stream: TextIO = sys.stderr,
+    *,
+    verbose: bool = False,
+) -> None:
+    for line in format_emitted_warnings(warnings, verbose=verbose):
+        print(line, file=stream)
 
 
 def format_summary_lines(summary: ScanSummary) -> list[str]:
@@ -2627,6 +2661,7 @@ def render_report(
     warnings: list[ParseWarning] | None = None,
     summary: ScanSummary | None = None,
     skipped: list[SkipRecord] | None = None,
+    verbose: bool = False,
 ) -> str:
     lines = [
         "# Quota drain evidence report",
@@ -2749,7 +2784,23 @@ def render_report(
     if warnings:
         lines += ["## Parse warnings", ""]
         lines.append("These records were skipped. They did not crash the scan.")
-        for w in warnings:
+        zst = [w for w in warnings if is_zst_unsupported_warning(w)]
+        others = [w for w in warnings if not is_zst_unsupported_warning(w)]
+        if zst and not verbose:
+            n = len(zst)
+            noun = "file" if n == 1 else "files"
+            lines.append(
+                f"- Skipped {n} .jsonl.zst {noun} because zstd support is unavailable. "
+                "Install with: pip install zstandard (Python 3.14+ also provides compression.zstd). "
+                "Re-run with --verbose to list each file."
+            )
+        else:
+            for w in zst:
+                shown_path = display_path(
+                    w.path, no_redact=no_redact, home=home, session_ids=all_ids, no_hash=no_hash
+                )
+                lines.append(f"- {ParseWarning(shown_path, w.line, w.message)}")
+        for w in others:
             shown_path = display_path(
                 w.path, no_redact=no_redact, home=home, session_ids=all_ids, no_hash=no_hash
             )
@@ -3188,15 +3239,22 @@ def _add_scan_args(p: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Do not replace the home directory with ~ in paths",
     )
+    p.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print each skipped .jsonl.zst path when zstd support is unavailable (default: one summary line)",
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="quota-guard",
         description=(
-            "Detect idle token/quota drain from local Claude Code and Codex CLI logs. "
+            "Detect idle token/quota drain from local Claude Code and Codex CLI logs, "
+            "and optionally audit agent configs for leaked secrets. "
             "Read-only: no credentials, no network, no process killing. "
-            "If no subcommand is given, 'scan' is used."
+            "Secret reports are redacted (first two characters + *** only). "
+            "If no subcommand is given, 'scan' is used. 'usage' is an alias of 'scan'."
         ),
     )
     parser.add_argument(
@@ -3211,6 +3269,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Scan local logs and print a summary plus alerts (default subcommand)",
     )
     _add_scan_args(scan_p)
+
+    usage_p = sub.add_parser(
+        "usage",
+        help="Alias of scan: detect idle token / quota drain",
+    )
+    _add_scan_args(usage_p)
 
     report_p = sub.add_parser(
         "report",
@@ -3229,13 +3293,73 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not replace the home directory with ~ in paths",
     )
+
+    sec_p = sub.add_parser(
+        "secrets",
+        help="Scan agent configs for leaked secrets (redacted, read-only, no network)",
+    )
+    _add_secrets_args(sec_p)
+
+    doc_p = sub.add_parser(
+        "doctor",
+        help="Run usage scan and secrets audit, then print a combined summary",
+    )
+    _add_doctor_args(doc_p)
     return parser
+
+
+KNOWN_COMMANDS = (
+    "scan",
+    "usage",
+    "report",
+    "check-config",
+    "secrets",
+    "doctor",
+)
+
+
+def _add_secrets_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--root", default=".", help="Project directory to scan (default: current directory)")
+    p.add_argument("--home", action="store_true", help="Also scan user-level agent configs under $HOME")
+    p.add_argument("--home-root", default="", help="Override home directory (for tests)")
+    p.add_argument("--ssh-config", default="", help="Extra SSH config file to check for ForwardAgent")
+    p.add_argument("--skip-git", action="store_true", help="Skip gitignore / git history checks")
+    p.add_argument(
+        "--include-deps",
+        action="store_true",
+        help="Also scan agent configs under node_modules, vendor, .venv, dist, build, and similar directories (skipped by default)",
+    )
+    p.add_argument("--report", default="", help="Write a redacted markdown report to this path")
+    p.add_argument("--json", action="store_true", help="Print machine-readable JSON to stdout")
+    p.add_argument("--fail-on", default="high", choices=["high", "medium", "low", "none"])
+    p.add_argument("--print-gitignore", action="store_true", help="Print suggested .gitignore lines and exit")
+    p.add_argument("--print-hook", action="store_true", help="Print a suggested pre-commit hook and exit")
+    p.add_argument(
+        "--no-redact-home",
+        action="store_true",
+        help="Do not replace the home directory with ~ in paths",
+    )
+
+
+def _add_doctor_args(p: argparse.ArgumentParser) -> None:
+    _add_scan_args(p)
+    p.add_argument("--root", default=".", help="Project directory for the secrets scan")
+    p.add_argument("--home", action="store_true", help="Also scan user-level agent configs under $HOME")
+    p.add_argument("--home-root", default="", help="Override home directory (for tests)")
+    p.add_argument("--ssh-config", default="", help="Extra SSH config file to check for ForwardAgent")
+    p.add_argument("--skip-git", action="store_true", help="Skip gitignore / git history checks")
+    p.add_argument(
+        "--include-deps",
+        action="store_true",
+        help="Also scan agent configs under node_modules, vendor, .venv, dist, build, and similar directories (skipped by default)",
+    )
+    p.add_argument("--fail-on", default="high", choices=["high", "medium", "low", "none"])
 
 
 def normalize_argv(argv: list[str]) -> list[str]:
     if not argv:
         return ["scan"]
-    if argv[0] in {"scan", "check-config", "report", "-h", "--help", "--version", "-V"}:
+    if argv[0] in {*KNOWN_COMMANDS, "-h", "--help", "--version", "-V"}:
         return argv
     if argv[0].startswith("-"):
         return ["scan", *argv]
@@ -3301,7 +3425,7 @@ def cmd_scan_or_report(args: argparse.Namespace, as_report: bool) -> int:
         long_run_seconds=args.long_run_seconds,
         min_severity=args.min_severity,
     )
-    emit_warnings(result.warnings)
+    emit_warnings(result.warnings, verbose=args.verbose)
     home = Path.home()
     shown = visible_alerts(result.alerts, args.min_severity)
 
@@ -3334,6 +3458,7 @@ def cmd_scan_or_report(args: argparse.Namespace, as_report: bool) -> int:
         warnings=result.warnings,
         summary=result.summary,
         skipped=result.skipped,
+        verbose=args.verbose,
     )
 
     if args.json:
@@ -3463,6 +3588,201 @@ def cmd_check_config(args: argparse.Namespace) -> int:
     return 0
 
 
+def _secrets_module():
+    # Imported lazily so `scan` / `report` / `check-config` stay usable even
+    # if the optional secrets module is missing from an older checkout.
+    import secrets_scan  # type: ignore
+
+    return secrets_scan
+
+
+def _display_secret_path(path: str, *, no_redact: bool, home: Path | None) -> str:
+    if no_redact or home is None:
+        return path
+    return redact_path(path, home)
+
+
+def cmd_secrets(args: argparse.Namespace) -> int:
+    secrets_scan = _secrets_module()
+    if args.print_gitignore:
+        sys.stdout.write(secrets_scan.suggest_gitignore())
+        return 0
+    if args.print_hook:
+        sys.stdout.write(secrets_scan.suggest_pre_commit_hook())
+        return 0
+
+    root = Path(args.root).expanduser().resolve()
+    home = None
+    if args.home or args.home_root:
+        home = Path(args.home_root or Path.home()).expanduser()
+    ssh_config = Path(args.ssh_config).expanduser() if args.ssh_config else None
+    result = secrets_scan.run_scan(root, home=home, ssh_config=ssh_config, skip_git=args.skip_git, include_deps=args.include_deps)
+
+    display_home = Path.home()
+    if not args.no_redact_home:
+        for f in result.findings:
+            f.path = _display_secret_path(f.path, no_redact=False, home=display_home)
+        result.files_scanned = [
+            _display_secret_path(p, no_redact=False, home=display_home) for p in result.files_scanned
+        ]
+
+    payload = secrets_scan.result_to_json(result)
+    public = json.dumps(payload, indent=2, ensure_ascii=False)
+    if args.json:
+        print(public)
+    else:
+        print(f"Scanned {len(result.files_scanned)} file(s). Findings: {len(result.findings)}")
+        if not result.findings:
+            print("No secret or git-hygiene issue detected.")
+        for f in result.findings:
+            print(f"[{f.severity.upper()}] {f.rule_id}: {f.path} ({f.location})")
+            print(f"         evidence: {f.evidence}")
+        for n in result.notes:
+            print(f"[note] {n}")
+
+    if args.report:
+        secrets_scan.write_report(Path(args.report), result)
+        print(f"Wrote report: {args.report}", file=sys.stderr)
+
+    if args.fail_on == "none":
+        return 0
+    rank = {"high": 0, "medium": 1, "low": 2}
+    threshold = rank[args.fail_on]
+    if any(rank.get(f.severity, 9) <= threshold for f in result.findings):
+        return 2
+    return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    secrets_scan = _secrets_module()
+    claude_roots = claude_roots_from_env_or_arg(args.claude_root)
+    codex_root = codex_root_from_env_or_arg(args.codex_root)
+    usage_result = scan_roots(
+        claude_roots,
+        codex_root,
+        args.idle_seconds,
+        args.token_threshold,
+        args.percent_threshold,
+        long_run_seconds=args.long_run_seconds,
+        min_severity=args.min_severity,
+    )
+    emit_warnings(usage_result.warnings, verbose=args.verbose)
+    home = Path.home()
+    shown = visible_alerts(usage_result.alerts, args.min_severity)
+
+    root = Path(args.root).expanduser().resolve()
+    secrets_home = Path(args.home_root).expanduser() if args.home_root else (Path.home() if args.home else None)
+    ssh_config = Path(args.ssh_config).expanduser() if args.ssh_config else None
+    secret_result = secrets_scan.run_scan(
+        root,
+        home=secrets_home,
+        ssh_config=ssh_config,
+        skip_git=args.skip_git,
+        include_deps=args.include_deps,
+    )
+    if not args.no_redact_home:
+        for f in secret_result.findings:
+            f.path = _display_secret_path(f.path, no_redact=False, home=home)
+        secret_result.files_scanned = [
+            _display_secret_path(p, no_redact=False, home=home) for p in secret_result.files_scanned
+        ]
+
+    usage_body = render_report(
+        shown,
+        usage_result.sessions,
+        no_hash=args.no_hash,
+        no_redact=args.no_redact_home,
+        home=home,
+        warnings=usage_result.warnings,
+        summary=usage_result.summary,
+        skipped=usage_result.skipped,
+        verbose=args.verbose,
+    )
+
+    if args.json:
+        all_ids = tuple(st.session_id for st in usage_result.sessions.values())
+        payload = {
+            "usage": {
+                "summary": _summary_dict(usage_result.summary),
+                "alerts": [
+                    a.public_dict(args.no_hash, args.no_redact_home, home, all_ids) for a in shown
+                ],
+            },
+            "secrets": secrets_scan.result_to_json(secret_result),
+        }
+        json.dump(payload, sys.stdout, indent=2, ensure_ascii=False)
+        print()
+    elif args.explain:
+        hits = match_sessions(usage_result.sessions, args.explain)
+        if not hits:
+            print(
+                f"No session matched {args.explain!r}. "
+                f"Scanned {usage_result.summary.sessions} session(s).",
+                file=sys.stderr,
+            )
+            return 1
+        for st in hits:
+            sys.stdout.write(
+                render_explain(
+                    st,
+                    no_hash=args.no_hash,
+                    no_redact=args.no_redact_home,
+                    home=home,
+                )
+            )
+        return 0
+    else:
+        print("== usage ==")
+        _print_scan_human(
+            usage_result,
+            no_hash=args.no_hash,
+            no_redact=args.no_redact_home,
+            home=home,
+            min_severity=args.min_severity,
+        )
+        print("== secrets ==")
+        print(
+            f"secrets: scanned {len(secret_result.files_scanned)} file(s), "
+            f"{len(secret_result.findings)} finding(s)"
+        )
+        if not secret_result.findings:
+            print("  No secret or git-hygiene issue detected.")
+        for f in secret_result.findings:
+            print(f"  [{f.severity.upper()}] {f.rule_id}: {f.path} ({f.location})")
+            print(f"           evidence: {f.evidence}")
+        for n in secret_result.notes:
+            print(f"  [note] {n}")
+
+    if args.report:
+        secrets_body = secrets_scan.render_report_text(secret_result)
+        combined = "\n".join(
+            [
+                "# quota-guard doctor report",
+                "",
+                "Generated locally. Secret values are redacted (first two characters + *** and length only).",
+                "No credentials were read. Nothing was uploaded.",
+                "",
+                "## Usage (idle drain)",
+                "",
+                usage_body,
+                "",
+                "## Secrets (agent config audit)",
+                "",
+                secrets_body,
+            ]
+        )
+        write_report(Path(args.report), combined)
+        print(f"Wrote report: {args.report}", file=sys.stderr)
+
+    secrets_code = 0
+    if args.fail_on != "none":
+        rank = {"high": 0, "medium": 1, "low": 2}
+        threshold = rank[args.fail_on]
+        if any(rank.get(f.severity, 9) <= threshold for f in secret_result.findings):
+            secrets_code = 2
+    return 2 if (shown or secrets_code == 2) else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     raw = normalize_argv(raw)
@@ -3472,8 +3792,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if command == "check-config":
             return cmd_check_config(args)
+        if command == "secrets":
+            return cmd_secrets(args)
+        if command == "doctor":
+            return cmd_doctor(args)
         if command == "report":
             return cmd_scan_or_report(args, as_report=True)
+        # scan and usage share this path
         return cmd_scan_or_report(args, as_report=False)
     except BrokenPipeError:  # pragma: no cover
         return 0
