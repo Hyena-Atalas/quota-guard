@@ -1,6 +1,6 @@
 # Comparison against current gitleaks and TruffleHog (local, 2026-11-10)
 
-This note records a read-only comparison run on the constructed `fixtures/secrets/` samples. It was not published. No raw secret values are included.
+This note records a read-only comparison run on the constructed `fixtures/secrets/` samples. No raw secret values are included.
 
 Versions installed on the box (checksum-verified GitHub release assets):
 
