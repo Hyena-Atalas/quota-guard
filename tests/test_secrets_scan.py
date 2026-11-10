@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -35,6 +36,14 @@ LEAKY_RAW_SECRETS = [
 ]
 
 REDACTED_EVIDENCE_RE = re.compile(r"^(?:\*\*\*|\S{2}\*\*\*) \(len=\d+\)$")
+
+
+def isolate_fixture(name: str, dest: Path) -> Path:
+    """Copy a fixture tree out of this repo so parent-repo git hygiene does not leak into tests."""
+    src = FIXTURES / name
+    dst = dest / name
+    shutil.copytree(src, dst)
+    return dst
 
 
 def run_cli(args: list[str]) -> subprocess.CompletedProcess[str]:
@@ -100,20 +109,22 @@ class SecretsScanTests(unittest.TestCase):
                     break
 
     def test_clean_project_is_silent(self) -> None:
-        result = secrets_scan.run_scan(FIXTURES / "clean")
-        self.assertEqual(
-            result.findings,
-            [],
-            f"unexpected findings: {[f.rule_id + ':' + f.evidence for f in result.findings]}",
-        )
+        with tempfile.TemporaryDirectory() as td:
+            result = secrets_scan.run_scan(isolate_fixture("clean", Path(td)))
+            self.assertEqual(
+                result.findings,
+                [],
+                f"unexpected findings: {[f.rule_id + ':' + f.evidence for f in result.findings]}",
+            )
 
     def test_false_positives_not_flagged(self) -> None:
-        result = secrets_scan.run_scan(FIXTURES / "false-positives")
-        self.assertEqual(
-            result.findings,
-            [],
-            f"false positives: {[f.rule_id + ':' + f.evidence for f in result.findings]}",
-        )
+        with tempfile.TemporaryDirectory() as td:
+            result = secrets_scan.run_scan(isolate_fixture("false-positives", Path(td)))
+            self.assertEqual(
+                result.findings,
+                [],
+                f"false positives: {[f.rule_id + ':' + f.evidence for f in result.findings]}",
+            )
 
     def test_ssh_forward_agent(self) -> None:
         result = secrets_scan.run_scan(
