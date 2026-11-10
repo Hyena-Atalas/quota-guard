@@ -206,6 +206,80 @@ class TestZstd(unittest.TestCase):
         self.assertEqual(result.summary.files_skipped, {"zst_unsupported": 1})
         self.assertEqual(result.scanned, [])
 
+    def test_zst_unsupported_warnings_are_summarized_unless_verbose(self) -> None:
+        warnings = [
+            qg.ParseWarning("/tmp/a.jsonl.zst", None, "skipped: zst unsupported (need Python 3.14+ compression.zstd or pip install zstandard)"),
+            qg.ParseWarning("/tmp/b.jsonl.zst", None, "skipped: zst unsupported (need Python 3.14+ compression.zstd or pip install zstandard)"),
+            qg.ParseWarning("/tmp/c.jsonl.zst", None, "skipped: zst unsupported (need Python 3.14+ compression.zstd or pip install zstandard)"),
+            qg.ParseWarning("/tmp/ok.jsonl", 3, "truncated or partial last line"),
+        ]
+        lines = qg.format_emitted_warnings(warnings, verbose=False)
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(lines[0].startswith("warning: skipped 3 .jsonl.zst files"))
+        self.assertIn("pip install zstandard", lines[0])
+        self.assertIn("--verbose", lines[0])
+        self.assertNotIn("/tmp/a.jsonl.zst", "\n".join(lines))
+        self.assertIn("truncated or partial last line", lines[1])
+
+        verbose_lines = qg.format_emitted_warnings(warnings, verbose=True)
+        self.assertEqual(len(verbose_lines), 4)
+        self.assertTrue(any("/tmp/a.jsonl.zst" in ln for ln in verbose_lines))
+        self.assertTrue(any("/tmp/c.jsonl.zst" in ln for ln in verbose_lines))
+        self.assertTrue(all(ln.startswith("warning: ") for ln in verbose_lines))
+
+    def test_cli_summarizes_multiple_zst_skips_and_lists_them_with_verbose(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            sessions = Path(td) / "sessions" / "2026" / "11" / "10"
+            sessions.mkdir(parents=True)
+            names = []
+            for i in range(3):
+                path = sessions / f"rollout-sess-zst-{i}.jsonl.zst"
+                path.write_bytes(b"not-a-zstd-frame")
+                names.append(path.name)
+            common = [
+                "scan",
+                "--claude-root",
+                str(ROOT / "fixtures" / "missing-claude"),
+                "--codex-root",
+                str(td),
+                "--json",
+            ]
+            # These dummy files are skipped only when no zstd backend is present.
+            # If a backend is installed, they become zst_error instead; still assert
+            # we do not print one identical-style flood without --verbose for unsupported.
+            proc = run_cli(common)
+            self.assertIn(proc.returncode, (0, 2), proc.stderr + proc.stdout)
+            if qg.zstd_backend() is None:
+                summary = [ln for ln in proc.stderr.splitlines() if "skipped 3 .jsonl.zst" in ln]
+                self.assertEqual(len(summary), 1, proc.stderr)
+                self.assertIn("pip install zstandard", summary[0])
+                for name in names:
+                    self.assertNotIn(name, proc.stderr)
+                verbose = run_cli([*common, "--verbose"])
+                self.assertIn(verbose.returncode, (0, 2), verbose.stderr + verbose.stdout)
+                for name in names:
+                    self.assertIn(name, verbose.stderr)
+                listed = [ln for ln in verbose.stderr.splitlines() if "zst unsupported" in ln]
+                self.assertEqual(len(listed), 3, verbose.stderr)
+            else:
+                # Backend present: dummy bytes are errors, not "unsupported". Still
+                # confirm --verbose exists and the command runs.
+                self.assertNotIn("skipped 3 .jsonl.zst", proc.stderr)
+
+    def test_report_summarizes_zst_skips_without_verbose(self) -> None:
+        warnings = [
+            qg.ParseWarning("/tmp/a.jsonl.zst", None, "skipped: zst unsupported (need pip install zstandard)"),
+            qg.ParseWarning("/tmp/b.jsonl.zst", None, "skipped: zst unsupported (need pip install zstandard)"),
+        ]
+        # Minimal empty sessions/alerts
+        body = qg.render_report([], {}, warnings=warnings, verbose=False)
+        self.assertIn("Skipped 2 .jsonl.zst files", body)
+        self.assertIn("pip install zstandard", body)
+        self.assertNotIn("/tmp/a.jsonl.zst", body)
+        verbose_body = qg.render_report([], {}, warnings=warnings, verbose=True)
+        self.assertIn("/tmp/a.jsonl.zst", verbose_body)
+        self.assertIn("/tmp/b.jsonl.zst", verbose_body)
+
     @unittest.skipUnless(qg.zstd_backend() is not None, "no zstd backend installed")
     def test_archived_zst_is_parsed_when_supported(self) -> None:
         path = REG_CODEX / "archived_sessions" / "rollout-sess-archived-zst.jsonl.zst"

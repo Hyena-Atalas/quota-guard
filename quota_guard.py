@@ -2431,9 +2431,39 @@ def scan_roots(
     return ScanResult(events, sessions, alerts, scanned, skipped, warnings, summary)
 
 
-def emit_warnings(warnings: list[ParseWarning], stream: TextIO = sys.stderr) -> None:
-    for w in warnings:
-        print(f"warning: {w}", file=stream)
+def is_zst_unsupported_warning(warning: ParseWarning) -> bool:
+    return "zst unsupported" in warning.message
+
+
+def format_emitted_warnings(warnings: list[ParseWarning], *, verbose: bool = False) -> list[str]:
+    """Format warnings for stderr. Collapse zst-unsupported skips unless verbose."""
+    lines: list[str] = []
+    zst = [w for w in warnings if is_zst_unsupported_warning(w)]
+    others = [w for w in warnings if not is_zst_unsupported_warning(w)]
+    if zst and not verbose:
+        n = len(zst)
+        noun = "file" if n == 1 else "files"
+        lines.append(
+            f"warning: skipped {n} .jsonl.zst {noun} because zstd support is unavailable. "
+            "Install with: pip install zstandard (Python 3.14+ also provides compression.zstd). "
+            "Re-run with --verbose to list each file."
+        )
+    else:
+        for w in zst:
+            lines.append(f"warning: {w}")
+    for w in others:
+        lines.append(f"warning: {w}")
+    return lines
+
+
+def emit_warnings(
+    warnings: list[ParseWarning],
+    stream: TextIO = sys.stderr,
+    *,
+    verbose: bool = False,
+) -> None:
+    for line in format_emitted_warnings(warnings, verbose=verbose):
+        print(line, file=stream)
 
 
 def format_summary_lines(summary: ScanSummary) -> list[str]:
@@ -2631,6 +2661,7 @@ def render_report(
     warnings: list[ParseWarning] | None = None,
     summary: ScanSummary | None = None,
     skipped: list[SkipRecord] | None = None,
+    verbose: bool = False,
 ) -> str:
     lines = [
         "# Quota drain evidence report",
@@ -2753,7 +2784,23 @@ def render_report(
     if warnings:
         lines += ["## Parse warnings", ""]
         lines.append("These records were skipped. They did not crash the scan.")
-        for w in warnings:
+        zst = [w for w in warnings if is_zst_unsupported_warning(w)]
+        others = [w for w in warnings if not is_zst_unsupported_warning(w)]
+        if zst and not verbose:
+            n = len(zst)
+            noun = "file" if n == 1 else "files"
+            lines.append(
+                f"- Skipped {n} .jsonl.zst {noun} because zstd support is unavailable. "
+                "Install with: pip install zstandard (Python 3.14+ also provides compression.zstd). "
+                "Re-run with --verbose to list each file."
+            )
+        else:
+            for w in zst:
+                shown_path = display_path(
+                    w.path, no_redact=no_redact, home=home, session_ids=all_ids, no_hash=no_hash
+                )
+                lines.append(f"- {ParseWarning(shown_path, w.line, w.message)}")
+        for w in others:
             shown_path = display_path(
                 w.path, no_redact=no_redact, home=home, session_ids=all_ids, no_hash=no_hash
             )
@@ -3192,6 +3239,11 @@ def _add_scan_args(p: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Do not replace the home directory with ~ in paths",
     )
+    p.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print each skipped .jsonl.zst path when zstd support is unavailable (default: one summary line)",
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -3272,6 +3324,11 @@ def _add_secrets_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--home-root", default="", help="Override home directory (for tests)")
     p.add_argument("--ssh-config", default="", help="Extra SSH config file to check for ForwardAgent")
     p.add_argument("--skip-git", action="store_true", help="Skip gitignore / git history checks")
+    p.add_argument(
+        "--include-deps",
+        action="store_true",
+        help="Also scan agent configs under node_modules, vendor, .venv, dist, build, and similar directories (skipped by default)",
+    )
     p.add_argument("--report", default="", help="Write a redacted markdown report to this path")
     p.add_argument("--json", action="store_true", help="Print machine-readable JSON to stdout")
     p.add_argument("--fail-on", default="high", choices=["high", "medium", "low", "none"])
@@ -3291,6 +3348,11 @@ def _add_doctor_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--home-root", default="", help="Override home directory (for tests)")
     p.add_argument("--ssh-config", default="", help="Extra SSH config file to check for ForwardAgent")
     p.add_argument("--skip-git", action="store_true", help="Skip gitignore / git history checks")
+    p.add_argument(
+        "--include-deps",
+        action="store_true",
+        help="Also scan agent configs under node_modules, vendor, .venv, dist, build, and similar directories (skipped by default)",
+    )
     p.add_argument("--fail-on", default="high", choices=["high", "medium", "low", "none"])
 
 
@@ -3363,7 +3425,7 @@ def cmd_scan_or_report(args: argparse.Namespace, as_report: bool) -> int:
         long_run_seconds=args.long_run_seconds,
         min_severity=args.min_severity,
     )
-    emit_warnings(result.warnings)
+    emit_warnings(result.warnings, verbose=args.verbose)
     home = Path.home()
     shown = visible_alerts(result.alerts, args.min_severity)
 
@@ -3396,6 +3458,7 @@ def cmd_scan_or_report(args: argparse.Namespace, as_report: bool) -> int:
         warnings=result.warnings,
         summary=result.summary,
         skipped=result.skipped,
+        verbose=args.verbose,
     )
 
     if args.json:
@@ -3553,7 +3616,7 @@ def cmd_secrets(args: argparse.Namespace) -> int:
     if args.home or args.home_root:
         home = Path(args.home_root or Path.home()).expanduser()
     ssh_config = Path(args.ssh_config).expanduser() if args.ssh_config else None
-    result = secrets_scan.run_scan(root, home=home, ssh_config=ssh_config, skip_git=args.skip_git)
+    result = secrets_scan.run_scan(root, home=home, ssh_config=ssh_config, skip_git=args.skip_git, include_deps=args.include_deps)
 
     display_home = Path.home()
     if not args.no_redact_home:
@@ -3603,7 +3666,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         long_run_seconds=args.long_run_seconds,
         min_severity=args.min_severity,
     )
-    emit_warnings(usage_result.warnings)
+    emit_warnings(usage_result.warnings, verbose=args.verbose)
     home = Path.home()
     shown = visible_alerts(usage_result.alerts, args.min_severity)
 
@@ -3611,7 +3674,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     secrets_home = Path(args.home_root).expanduser() if args.home_root else (Path.home() if args.home else None)
     ssh_config = Path(args.ssh_config).expanduser() if args.ssh_config else None
     secret_result = secrets_scan.run_scan(
-        root, home=secrets_home, ssh_config=ssh_config, skip_git=args.skip_git
+        root,
+        home=secrets_home,
+        ssh_config=ssh_config,
+        skip_git=args.skip_git,
+        include_deps=args.include_deps,
     )
     if not args.no_redact_home:
         for f in secret_result.findings:
@@ -3629,6 +3696,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         warnings=usage_result.warnings,
         summary=usage_result.summary,
         skipped=usage_result.skipped,
+        verbose=args.verbose,
     )
 
     if args.json:

@@ -204,6 +204,10 @@ Paths scanned when you pass `--root` (project) or `--home` (optional user direct
 - With `--home`: the same kind of files under `$HOME`, plus `~/.ssh/config` for `ForwardAgent yes` (config only; this cannot prove a running app is forwarding the agent)
 - Git hygiene: whether `settings.local.json` is in the project's `.gitignore`, whether sensitive agent files are tracked, and whether they still appear in `git log --all`
 
+Recursive discovery skips `node_modules`, `.git`, `vendor`, `.venv`, `venv`, `dist`, `build`, `target`, and similar directories by default, so a third-party package's own `.claude/settings.local.json` is not treated as yours. Pass `--include-deps` to scan them anyway.
+
+If zstd support is missing, `scan` / `usage` / `report` / `doctor` print one summary line for skipped `.jsonl.zst` files and suggest `pip install zstandard`. Pass `--verbose` to list each file.
+
 ## License
 
 MIT. Copyright (c) 2026 Hyena-Atalas.

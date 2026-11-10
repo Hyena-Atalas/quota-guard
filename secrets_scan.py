@@ -567,15 +567,54 @@ def scan_git_hygiene(root: Path) -> list[Finding]:
 # Discovery
 # ---------------------------------------------------------------------------
 
-def discover_project_files(root: Path) -> list[Path]:
+# Vendor / build / VCS directories whose bundled agent configs are not the
+# user's project. Recursive discovery skips these unless include_deps=True.
+DEFAULT_SKIP_DIR_NAMES = frozenset(
+    {
+        "node_modules",
+        ".git",
+        "vendor",
+        ".venv",
+        "venv",
+        "dist",
+        "build",
+        "target",
+        "__pycache__",
+        ".tox",
+        ".nox",
+        "site-packages",
+    }
+)
+
+
+def path_is_in_skipped_dir(path: Path, root: Path) -> bool:
+    """True when a file sits under a default skip directory inside root."""
+    try:
+        rel = path.resolve().relative_to(root.resolve())
+    except (OSError, ValueError):
+        rel = Path(*path.parts)
+    return any(part.lower() in DEFAULT_SKIP_DIR_NAMES for part in rel.parts)
+
+
+def discover_project_files(root: Path, include_deps: bool = False) -> list[Path]:
     files: list[Path] = []
     for rel in PROJECT_RELATIVE_PATHS:
         path = root / rel
         if path.is_file():
             files.append(path)
-    # Monorepos: any nested settings.local.json / .mcp.json
-    for pattern in (".claude/settings.local.json", ".claude/settings.json", ".mcp.json", ".cursor/mcp.json"):
-        files.extend(p for p in root.glob(f"**/{pattern}") if p.is_file())
+    # Walk so skip directories can be pruned (glob('**') would still descend).
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        if not include_deps:
+            dirnames[:] = [d for d in dirnames if d.lower() not in DEFAULT_SKIP_DIR_NAMES]
+        current = Path(dirpath)
+        if current.name == ".claude":
+            for name in ("settings.local.json", "settings.json"):
+                if name in filenames:
+                    files.append(current / name)
+        if ".mcp.json" in filenames:
+            files.append(current / ".mcp.json")
+        if current.name == ".cursor" and "mcp.json" in filenames:
+            files.append(current / "mcp.json")
     # Unique, keep stable order
     seen: set[Path] = set()
     out: list[Path] = []
@@ -768,9 +807,10 @@ def run_scan(
     home: Path | None = None,
     ssh_config: Path | None = None,
     skip_git: bool = False,
+    include_deps: bool = False,
 ) -> ScanResult:
     result = ScanResult()
-    files = discover_project_files(root)
+    files = discover_project_files(root, include_deps=include_deps)
     if home is not None:
         files.extend(discover_home_files(home))
     if ssh_config is not None and ssh_config.is_file():
@@ -815,6 +855,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--home-root", default="", help="Override home directory (for tests)")
     p.add_argument("--ssh-config", default="", help="Extra SSH config file to check for ForwardAgent")
     p.add_argument("--skip-git", action="store_true", help="Skip gitignore / git history checks")
+    p.add_argument(
+        "--include-deps",
+        action="store_true",
+        help="Also scan agent configs under node_modules, vendor, .venv, dist, build, and similar directories (skipped by default)",
+    )
     p.add_argument("--report", default="", help="Write a redacted markdown report to this path")
     p.add_argument("--json", action="store_true")
     p.add_argument("--fail-on", default="high", choices=["high", "medium", "low", "none"])
@@ -835,7 +880,13 @@ def main(argv: list[str] | None = None) -> int:
         home = Path(args.home_root or Path.home()).expanduser()
     ssh_config = Path(args.ssh_config).expanduser() if args.ssh_config else None
 
-    result = run_scan(root, home=home, ssh_config=ssh_config, skip_git=args.skip_git)
+    result = run_scan(
+        root,
+        home=home,
+        ssh_config=ssh_config,
+        skip_git=args.skip_git,
+        include_deps=args.include_deps,
+    )
 
     payload = result_to_json(result)
     public = json.dumps(payload, indent=2, ensure_ascii=False)

@@ -179,6 +179,87 @@ class SecretsScanTests(unittest.TestCase):
         self.assertIn("line ", md.lower())
 
 
+
+    def test_skips_dependency_dirs_by_default_and_include_deps_opts_in(self) -> None:
+        project_secret = "FAKEPROJ-db-pass-NOTREAL99"
+        dep_secret = "FAKEDEPS-root-pass-NOTREAL99"
+        vendor_secret = "FAKEVEND-ssh-pass-NOTREAL99"
+        settings = lambda secret: (
+            '{"_comment":"FAKE fixture","permissions":{"allow":["Bash(PGPASSWORD='
+            + secret
+            + ' psql)"]}}\n'
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".claude").mkdir()
+            (root / ".claude" / "settings.local.json").write_text(settings(project_secret), encoding="utf-8")
+            nested = root / "node_modules" / "resolve" / ".claude"
+            nested.mkdir(parents=True)
+            (nested / "settings.local.json").write_text(settings(dep_secret), encoding="utf-8")
+            vdir = root / ".venv" / "lib" / ".claude"
+            vdir.mkdir(parents=True)
+            (vdir / "settings.local.json").write_text(
+                '{"permissions":{"allow":["Bash(sshpass -p ' + vendor_secret + ' ssh host)"]}}\n',
+                encoding="utf-8",
+            )
+            # A nested project outside skip dirs should still be found.
+            app = root / "apps" / "web" / ".claude"
+            app.mkdir(parents=True)
+            (app / "settings.local.json").write_text(
+                '{"permissions":{"allow":["Bash(mysql -pDemoPass123 -u root)"]}}\n',
+                encoding="utf-8",
+            )
+
+            default = secrets_scan.run_scan(root, skip_git=True)
+            scanned = default.files_scanned
+            self.assertTrue(any(Path(p).parts[-2:] == (".claude", "settings.local.json") and "node_modules" not in Path(p).parts for p in scanned))
+            self.assertFalse(any("node_modules" in Path(p).parts for p in scanned))
+            self.assertFalse(any(".venv" in Path(p).parts for p in scanned))
+            self.assertTrue(any("apps" in Path(p).parts for p in scanned))
+            rules = {f.rule_id for f in default.findings}
+            self.assertIn("pgpassword", rules)
+            self.assertIn("mysql-p", rules)
+            self.assertNotIn("sshpass-p", rules)
+            public = json.dumps(secrets_scan.result_to_json(default), ensure_ascii=False)
+            public += secrets_scan.render_report_text(default)
+            self.assertNotIn(dep_secret, public)
+            self.assertNotIn(vendor_secret, public)
+            self.assertNotIn(project_secret, public)
+
+            included = secrets_scan.run_scan(root, skip_git=True, include_deps=True)
+            self.assertTrue(any("node_modules" in Path(p).parts for p in included.files_scanned))
+            self.assertTrue(any(".venv" in Path(p).parts for p in included.files_scanned))
+            included_rules = {f.rule_id for f in included.findings}
+            self.assertIn("pgpassword", included_rules)
+            self.assertIn("sshpass-p", included_rules)
+            public2 = json.dumps(secrets_scan.result_to_json(included), ensure_ascii=False)
+            self.assertNotIn(dep_secret, public2)
+            self.assertNotIn(vendor_secret, public2)
+
+    def test_cli_include_deps_flag(self) -> None:
+        dep_secret = "FAKECLI-dep-pass-NOTREAL99"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            nested = root / "node_modules" / "resolve" / ".claude"
+            nested.mkdir(parents=True)
+            (nested / "settings.local.json").write_text(
+                '{"permissions":{"allow":["Bash(PGPASSWORD=' + dep_secret + ' psql)"]}}\n',
+                encoding="utf-8",
+            )
+            off = run_cli(["secrets", "--root", str(root), "--skip-git", "--json", "--fail-on", "none"])
+            self.assertEqual(off.returncode, 0, off.stderr + off.stdout)
+            payload = json.loads(off.stdout)
+            self.assertFalse(any("node_modules" in p for p in payload["files_scanned"]))
+            self.assertEqual(payload["findings"], [])
+            self.assertNotIn(dep_secret, off.stdout)
+
+            on = run_cli(["secrets", "--root", str(root), "--skip-git", "--include-deps", "--json"])
+            self.assertEqual(on.returncode, 2, on.stderr + on.stdout)
+            payload_on = json.loads(on.stdout)
+            self.assertTrue(any("node_modules" in p for p in payload_on["files_scanned"]))
+            self.assertTrue(any("pgpassword" in f["rule_id"] for f in payload_on["findings"]))
+            self.assertNotIn(dep_secret, on.stdout)
+
     def test_highentropy_fixture_catches_command_passwords_and_redacts(self) -> None:
         raw = highentropy_raw_secrets()
         self.assertTrue(any(v.startswith("ghp_FAKE") and len(v) == 40 for v in raw))
