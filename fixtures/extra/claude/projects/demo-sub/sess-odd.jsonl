@@ -1,0 +1,4 @@
+{"type": "user", "timestamp": "2026-11-10T06:59:50.000Z", "sessionId": "sess-odd", "message": {"role": "user", "content": "odd sample"}}
+{"type": "assistant", "timestamp": "2026-11-10T07:00:00.000Z", "sessionId": "sess-odd", "requestId": "req_missing", "message": {"id": "msg_missing", "usage": {}}}
+{"type": "assistant", "timestamp": "2026-11-10T07:00:01.000Z", "sessionId": "sess-odd", "requestId": "req_unknown", "message": {"id": "msg_unknown", "usage": {"token_count_v99": 42, "schema": "future"}}}
+{"type": "assistant", "timestamp": "2026-11-10T07:00:02.000Z", "sessionId": "sess-odd", "requestId": "req_ok", "message": {"id": "msg_odd_ok", "usage": {"input_tokens": 8, "output_tokens": 2}}}

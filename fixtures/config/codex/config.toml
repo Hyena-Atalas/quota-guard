@@ -1,0 +1,8 @@
+# Constructed sample — not a real user config
+[features]
+memories = true
+
+[memories]
+generate_memories = true
+use_memories = true
+min_rate_limit_remaining_percent = 15

@@ -1,0 +1,85 @@
+name: I caught an idle-drain event
+description: Share a redacted timeline after quota-guard flagged type A or B on your machine.
+title: "[idle-drain] "
+labels: ["idle-drain"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you. Please help us understand a **real** idle-drain capture without sharing secrets.
+
+        **Do not upload original JSONL, transcripts, screenshots of prompts, source code, API keys, or auth files.** The report should already contain only timestamps, counts, and hashed session ids. If you paste anything else, redact it first.
+  - type: checkboxes
+    id: redaction
+    attributes:
+      label: Redaction
+      description: These are required. Issues that include raw logs or secrets may be deleted.
+      options:
+        - label: I will not attach original Claude or Codex session logs (`.jsonl` or similar).
+          required: true
+        - label: Anything I paste has been stripped of prompt text, source code, file contents, secrets, tokens, and personal paths I do not want public.
+          required: true
+        - label: I understand this tool is not an official dashboard and that a capture is not a promise that Support will refund or reset quota.
+          required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS
+        - Windows
+        - Linux
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: client
+    attributes:
+      label: Which client produced the logs you scanned?
+      options:
+        - Claude Code
+        - Codex CLI
+        - Both
+        - Not sure
+    validations:
+      required: true
+  - type: dropdown
+    id: alert_type
+    attributes:
+      label: Detection type reported by quota-guard
+      options:
+        - Type A (local tokens grew after the idle window)
+        - Type B (quota percent rose with no matching local token delta)
+        - Both / mixed
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: quota-guard version and flags
+      description: "Example: 0.1.0, --idle-seconds 180"
+    validations:
+      required: true
+  - type: textarea
+    id: timeline
+    attributes:
+      label: Redacted timeline
+      description: Paste timestamps, token counts, and used_percent steps only. Hashed session ids are fine. No prompt text.
+      render: markdown
+    validations:
+      required: true
+  - type: textarea
+    id: official
+    attributes:
+      label: Did this roughly line up with /usage, /status, or the official usage page?
+      description: A yes/no and a short note is enough. You may describe percentages; please do not paste account identifiers.
+    validations:
+      required: false
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else (optional)
+      description: Parse warnings, config-check notes (key names only), or why you think this might be a shared pool / other device / lag. Still no raw logs.
+    validations:
+      required: false

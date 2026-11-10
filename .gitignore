@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.venv/
+venv/
+env/
+
+# Editors / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local reports and ad-hoc output
+/tmp/
+*.local.md
+
+# Never commit credentials or live session databases, even by accident.
+auth.json
+.credentials.json
+credentials.json
+**/logs_2.sqlite
+**/.codex/auth.json
+**/.claude/.credentials.json

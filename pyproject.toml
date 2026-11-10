@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quota-guard"
+version = "0.1.0"
+description = "Free, read-only CLI that looks for idle token and quota drain in local Claude Code and Codex CLI logs."
+readme = "README.md"
+license = { file = "LICENSE" }
+# Author is a placeholder. Replace <AUTHOR> before you publish the repository.
+authors = [{ name = "<AUTHOR>" }]
+requires-python = ">=3.11"
+keywords = ["claude", "codex", "quota", "cli"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Utilities",
+]
+
+[project.scripts]
+quota-guard = "quota_guard:main"
+
+[project.urls]
+# Replace the placeholder before publishing.
+Homepage = "<REPO_URL>"
+Issues = "<REPO_URL>/issues"
+
+[tool.setuptools]
+py-modules = ["quota_guard"]

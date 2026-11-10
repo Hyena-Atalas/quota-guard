@@ -1,0 +1,73 @@
+name: I ran it successfully
+description: Tell us that a scan or config check ran on your machine, and whether the output looked reasonable.
+title: "[feedback] Ran successfully"
+labels: ["feedback"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This template is for **install and run feedback**, not for uploading logs.
+
+        **Do not attach original session files.** They often contain source code, prompts, and secrets.
+  - type: checkboxes
+    id: redaction
+    attributes:
+      label: Redaction
+      options:
+        - label: I will not upload original Claude or Codex session logs.
+          required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS
+        - Windows
+        - Linux
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: "3.11 / 3.12 / 3.13"
+    validations:
+      required: true
+  - type: dropdown
+    id: client
+    attributes:
+      label: What did you scan?
+      options:
+        - Claude Code logs
+        - Codex CLI logs
+        - Both
+        - Only check-config
+        - Only the constructed fixtures in this repo
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: What happened?
+      description: Did scan / report / check-config finish? Any parse warnings (you can paste the warning text, not the log line)? Were the counts in the same ballpark as /usage or /status?
+    validations:
+      required: true
+  - type: dropdown
+    id: idle_window
+    attributes:
+      label: Was the default 3-minute idle window reasonable?
+      options:
+        - Yes
+        - Too noisy (false positives)
+        - Too strict (missed something I expected)
+        - I changed --idle-seconds
+        - Not sure / I only ran fixtures
+    validations:
+      required: false
+  - type: textarea
+    id: extra
+    attributes:
+      label: Other notes (optional)
+    validations:
+      required: false

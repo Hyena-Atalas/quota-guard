@@ -1,0 +1,3 @@
+# Only one documented key is set; others are absent on purpose.
+[features]
+memories = false
