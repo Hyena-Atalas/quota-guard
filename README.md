@@ -108,17 +108,18 @@ If a credentials-like filename appears next to logs, it is skipped on purpose.
 
 The quiet gap defaults to **3 minutes** and is configurable. Detection walks events in **timestamp order** and uses the **last real user prompt** as the only anchor. Tool results, `isSidechain` / `subagents/` records, and meta or `<system-reminder>` injections are not anchors. Usage while a tool call is still open is treated as part of the same run.
 
+On current Codex rollouts, a real user prompt is a `response_item` message with `payload.role=user` where `metadata.client_authored` is true and `metadata.inherited_user_message` is not true. If `client_authored` is absent, the tool falls back to `role=user` (and not `developer`). Older `event_msg/user_message` records are still accepted. `task_started` is shown on the `--explain` timeline with its raw `turn_trigger` but is not a user anchor. Sub-agent turns (a nested `initiating_agent_path`, or `inter_agent_communication_metadata`) are excluded from idle detection. Prefer `token_usage_record` over `event_msg/token_count` when both exist (deduped by `response_id`).
+
 **New tokens vs cache reads.** Idle increments use `input_tokens + output_tokens + cache_creation_input_tokens` (plus Codex `reasoning_output_tokens` when present). `cache_read_input_tokens` / `cached_input_tokens` are recorded on the timeline and **not** added. A later turn that mostly rereads a large cache can show tens of millions of cache_read tokens and still correctly stay under the new-token threshold (default 200).
 
 **Type A — new tokens grew after a quiet gap.** After the last real user input, there was a gap of at least `--idle-seconds` with no activity (and no open tool call), and then new tokens increased by at least `--token-threshold`. That can be background work the official apps document (memories, recap, idle compaction, prompt suggestions, scheduled tasks, and similar), or a session that did not actually stop. This is **not** proof of a vendor bug.
 
 **Long runs are not idle drain.** If you gave the agent a task and it kept working without a quiet gap, that is expected. If that continuous run lasts at least `--long-run-seconds` (default 30 minutes), quota-guard emits a low-severity `long_run` alert instead of `idle_drain`. Those alerts are hidden unless you pass `--min-severity low`.
 
-**Type B — Codex `used_percent` rose, but local new tokens did not.** The official client writes rate-limit snapshots into local Codex logs. Those snapshots are **not a live API** and may lag. A Type B alert means: *this machine's log did not show a matching new-token delta after the quiet gap*. It does **not** mean the usage is fake. Common explanations you should consider first:
+**Type B — Codex `used_percent` rose, but local new tokens did not.** The official client writes rate-limit snapshots into local Codex logs. Those snapshots are **not a live API** and may lag. Comparisons are grouped by `limit_id` across all local sessions (the same pool can appear in concurrent sessions). A change in `resets_at` is treated as a window reset, not as growth. If **any** local session recorded new tokens in that interval, it is not Type B. A Type B alert means: *no local log on this machine showed a matching new-token delta for that `limit_id` in the interval*. It does **not** mean the usage is fake. Still out of view:
 
-- **Shared quota pools.** Some plans share usage across Codex, ChatGPT, and other surfaces. This tool only sees the logs on *this* machine.
 - **Other devices** signed into the same account.
-- **Cloud / scheduled tasks** that keep running while the computer sleeps.
+- **Cloud / scheduled tasks** and other surfaces that do not write local logs (some plans share usage across Codex, ChatGPT, and other products).
 - **Accounting delay** between local activity and the snapshot written to the log.
 
 Claude JSONL generally has **tokens, not official 5-hour or weekly percent bars**. Local totals can disagree with `/usage`, `/status`, and the website. Use those official views as the authority; use this report as a timeline of what this machine wrote down.

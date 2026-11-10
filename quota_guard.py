@@ -17,16 +17,18 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import os
 import sys
 from collections import Counter, defaultdict
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, TextIO
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # Default idle window: usage after this many seconds of quiet following the
 # last real user input (and after any in-progress tool call) is "idle".
@@ -59,6 +61,7 @@ KNOWN_TOKEN_KEYS = (
     "cache_read_input_tokens",
     "cached_input_tokens",
     "cache_creation_input_tokens",
+    "cache_write_input_tokens",
     "reasoning_output_tokens",
     "total_tokens",
 )
@@ -225,8 +228,12 @@ def path_looks_like_subagent(path: Path) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# zstd (optional)
+# zstd (optional) and line-oriented log reading
 # ---------------------------------------------------------------------------
+
+
+class ZstdUnsupported(RuntimeError):
+    pass
 
 
 def zstd_backend() -> str | None:
@@ -248,17 +255,106 @@ def zstd_backend() -> str | None:
         return None
 
 
-def decompress_zstd_bytes(data: bytes) -> bytes:
+def _zstd_stream_reader(binary_fh):
+    """Return a binary stream that concatenates all zstd frames.
+
+    A one-shot decompressor may stop after the first frame. Archived rollouts
+    can be multi-frame; TextIOWrapper on a stream reader also keeps line
+    boundaries intact across read buffers.
+    """
     backend = zstd_backend()
     if backend == "compression.zstd":
         from compression import zstd  # type: ignore[import-not-found]
 
+        decompressor = zstd.ZstdDecompressor()
+        if hasattr(decompressor, "stream_reader"):
+            return decompressor.stream_reader(binary_fh)
+        if hasattr(zstd, "open"):
+            # zstd.open may re-open by path; fall back to reading all frames.
+            return io.BytesIO(_decompress_all_frames_stdlib(binary_fh.read()))
+        return io.BytesIO(zstd.decompress(binary_fh.read()))
+    if backend == "zstandard":
+        import zstandard  # type: ignore[import-not-found]
+
+        return zstandard.ZstdDecompressor().stream_reader(binary_fh)
+    raise ZstdUnsupported("zst unsupported")
+
+
+def _decompress_all_frames_stdlib(data: bytes) -> bytes:
+    from compression import zstd  # type: ignore[import-not-found]
+
+    out = io.BytesIO()
+    view = memoryview(data)
+    offset = 0
+    while offset < len(view):
+        try:
+            chunk = zstd.decompress(view[offset:])
+        except Exception:
+            break
+        out.write(chunk)
+        # stdlib may not expose the consumed length; stop after one frame
+        # if we cannot advance. stream_reader is preferred above.
+        break
+    return out.getvalue()
+
+
+def decompress_zstd_bytes(data: bytes) -> bytes:
+    """Decompress one or more zstd frames into bytes (used by tests and fallbacks)."""
+    backend = zstd_backend()
+    if backend == "compression.zstd":
+        from compression import zstd  # type: ignore[import-not-found]
+
+        if hasattr(zstd, "ZstdDecompressor") and hasattr(zstd.ZstdDecompressor(), "stream_reader"):
+            reader = zstd.ZstdDecompressor().stream_reader(io.BytesIO(data))
+            try:
+                return reader.read()
+            finally:
+                reader.close()
         return zstd.decompress(data)
     if backend == "zstandard":
         import zstandard  # type: ignore[import-not-found]
 
-        return zstandard.ZstdDecompressor().decompress(data)
+        reader = zstandard.ZstdDecompressor().stream_reader(io.BytesIO(data))
+        try:
+            return reader.read()
+        finally:
+            reader.close()
     raise RuntimeError("zst unsupported")
+
+
+@contextmanager
+def open_log_text(path: Path):
+    """Yield a text stream for a .jsonl or .jsonl.zst file, line-buffered correctly."""
+    if is_jsonl_zst(path):
+        if zstd_backend() is None:
+            raise ZstdUnsupported(
+                "skipped: zst unsupported (need Python 3.14+ compression.zstd or pip install zstandard)"
+            )
+        fh = path.open("rb")
+        reader = None
+        wrapper = None
+        try:
+            reader = _zstd_stream_reader(fh)
+            wrapper = io.TextIOWrapper(reader, encoding="utf-8", errors="strict", newline="")
+            yield wrapper
+        finally:
+            if wrapper is not None:
+                try:
+                    wrapper.close()
+                except Exception:
+                    pass
+            if reader is not None and reader is not fh:
+                try:
+                    reader.close()
+                except Exception:
+                    pass
+            fh.close()
+        return
+    fh = path.open("r", encoding="utf-8", newline="")
+    try:
+        yield fh
+    finally:
+        fh.close()
 
 
 def read_log_text(path: Path, warnings: list[ParseWarning]) -> tuple[str | None, str | None]:
@@ -267,29 +363,22 @@ def read_log_text(path: Path, warnings: list[ParseWarning]) -> tuple[str | None,
         warnings.append(ParseWarning(str(path), None, "refusing to read a credentials-like filename"))
         return None, "forbidden"
     try:
-        raw = path.read_bytes()
+        with open_log_text(path) as fh:
+            return fh.read(), None
+    except ZstdUnsupported as exc:
+        warnings.append(ParseWarning(str(path), None, str(exc)))
+        return None, "zst_unsupported"
     except OSError as exc:
         warnings.append(ParseWarning(str(path), None, f"could not read file: {exc}"))
         return None, "unreadable"
-    if is_jsonl_zst(path):
-        if zstd_backend() is None:
-            warnings.append(
-                ParseWarning(
-                    str(path),
-                    None,
-                    "skipped: zst unsupported (need Python 3.14+ compression.zstd or pip install zstandard)",
-                )
-            )
-            return None, "zst_unsupported"
-        try:
-            raw = decompress_zstd_bytes(raw)
-        except Exception as exc:  # noqa: BLE001 - stay up on corrupt archives
-            warnings.append(ParseWarning(str(path), None, f"could not decompress .jsonl.zst: {exc}"))
-            return None, "zst_error"
-    try:
-        return raw.decode("utf-8"), None
     except UnicodeDecodeError as exc:
         warnings.append(ParseWarning(str(path), None, f"could not decode as utf-8: {exc}"))
+        return None, "unreadable"
+    except Exception as exc:  # noqa: BLE001 - remain up on corrupt zstd archives
+        if is_jsonl_zst(path):
+            warnings.append(ParseWarning(str(path), None, f"could not decompress .jsonl.zst: {exc}"))
+            return None, "zst_error"
+        warnings.append(ParseWarning(str(path), None, f"could not read file: {exc}"))
         return None, "unreadable"
 
 
@@ -304,15 +393,23 @@ class Event:
     session_id: str
     path: str
     ts: datetime | None
-    kind: str  # user | tool_result | tool_use | usage | quota | meta | sidechain
-    tokens: int = 0  # new tokens: input+output+cache_creation (+ reasoning)
+    kind: str  # user | inherited_user | tool_result | tool_use | usage | quota | meta | sidechain | turn_start
+    tokens: int = 0  # new tokens: input+output+cache_creation/cache_write (+ reasoning)
     cache_read: int = 0
     used_percent: float | None = None
     window_label: str | None = None
     note: str = ""
     is_sidechain: bool = False
-    tool_delta: int = 0  # +N tool_use opened, -N tool_result closed
+    tool_delta: int = 0
     record_type: str = ""
+    anchor_type: str = ""
+    limit_id: str = ""
+    limit_name: str = ""
+    resets_at: datetime | None = None
+    response_id: str = ""
+    turn_id: str = ""
+    turn_trigger: str = ""  # raw value; not interpreted
+    initiating_agent_path: str = ""
 
 
 @dataclass
@@ -327,11 +424,30 @@ class SessionState:
     total_cache_read: int = 0
     last_used_percent: dict[str, float] = field(default_factory=dict)
     is_sidechain: bool = False
+    last_anchor_type: str = ""
+    no_anchor_reason: str | None = None  # no_user_messages | all_inherited | sub_agent
 
 
 # ---------------------------------------------------------------------------
 # JSONL reader
 # ---------------------------------------------------------------------------
+
+
+def _format_line_span(lines: list[int]) -> str:
+    if not lines:
+        return ""
+    lines = sorted(lines)
+    # Collapse consecutive runs: 726-730, 740
+    parts: list[str] = []
+    start = prev = lines[0]
+    for n in lines[1:]:
+        if n == prev + 1:
+            prev = n
+            continue
+        parts.append(str(start) if start == prev else f"{start}-{prev}")
+        start = prev = n
+    parts.append(str(start) if start == prev else f"{start}-{prev}")
+    return ", ".join(parts)
 
 
 def iter_jsonl(
@@ -340,51 +456,134 @@ def iter_jsonl(
 ) -> Iterable[tuple[int, dict[str, Any]]]:
     """Yield (line_number, object) for complete JSON objects.
 
-    A truncated or half-written last line is skipped with a warning.
-    If the file cannot be opened, the function yields nothing (caller should
-    have already recorded a skip where appropriate).
+    Lines are assembled via a text stream (TextIOWrapper over a zstd stream
+    reader when needed) so a decompressor buffer boundary cannot split a line.
+    Malformed or non-JSON lines in one file are aggregated into a single warning.
     """
     if warnings is None:
         warnings = []
-    text, _reason = read_log_text(path, warnings)
-    if text is None:
+    if is_forbidden_path(path):
+        warnings.append(ParseWarning(str(path), None, "refusing to read a credentials-like filename"))
         return
-    yield from iter_jsonl_text(str(path), text, warnings)
+    malformed: list[int] = []
+    truncated_last: int | None = None
+    line_no = 0
+    last_had_newline = True
+    last_nonempty: int | None = None
+    try:
+        with open_log_text(path) as fh:
+            while True:
+                line = fh.readline()
+                if line == "":
+                    break
+                line_no += 1
+                last_had_newline = line.endswith("\n") or line.endswith("\r")
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                last_nonempty = line_no
+                try:
+                    obj = json.loads(stripped)
+                except json.JSONDecodeError:
+                    # A last line with no terminating newline is the usual
+                    # half-written record; other failures are malformed/non-JSON.
+                    if not last_had_newline:
+                        truncated_last = line_no
+                    else:
+                        malformed.append(line_no)
+                    continue
+                if not isinstance(obj, dict):
+                    malformed.append(line_no)
+                    continue
+                yield line_no, obj
+    except ZstdUnsupported as exc:
+        warnings.append(ParseWarning(str(path), None, str(exc)))
+        return
+    except OSError as exc:
+        warnings.append(ParseWarning(str(path), None, f"could not read file: {exc}"))
+        return
+    except UnicodeDecodeError as exc:
+        warnings.append(ParseWarning(str(path), None, f"could not decode as utf-8: {exc}"))
+        return
+    except Exception as exc:  # noqa: BLE001
+        if is_jsonl_zst(path):
+            warnings.append(ParseWarning(str(path), None, f"could not decompress .jsonl.zst: {exc}"))
+        else:
+            warnings.append(ParseWarning(str(path), None, f"could not read file: {exc}"))
+        return
+
+    if truncated_last is None and malformed and last_nonempty == malformed[-1]:
+        truncated_last = malformed.pop()
+    bits: list[str] = []
+    if malformed:
+        bits.append(
+            f"{len(malformed)} malformed or non-JSON line(s) skipped ({_format_line_span(malformed)})"
+        )
+    if truncated_last is not None:
+        bits.append(
+            f"truncated or partial last line skipped (line {truncated_last}; session may still be writing)"
+        )
+    if bits:
+        warnings.append(ParseWarning(str(path), None, "; ".join(bits)))
 
 
 def iter_jsonl_text(
     path_label: str, text: str, warnings: list[ParseWarning]
 ) -> Iterable[tuple[int, dict[str, Any]]]:
-    raw_lines = text.splitlines()
-    last_nonempty = 0
-    for i, line in enumerate(raw_lines, start=1):
-        if line.strip():
-            last_nonempty = i
+    """Parse a complete text buffer. Used by tests that feed constructed strings."""
+    # Reuse the same aggregation rules as the file reader.
+    class _Buf:
+        def __init__(self, s: str) -> None:
+            self._io = io.StringIO(s)
 
-    for i, line in enumerate(raw_lines, start=1):
+        def readline(self) -> str:
+            return self._io.readline()
+
+        def close(self) -> None:
+            self._io.close()
+
+    # Temporary path-like label only; walk the string with the same line rules.
+    malformed: list[int] = []
+    truncated_last: int | None = None
+    line_no = 0
+    last_had_newline = True
+    last_nonempty: int | None = None
+    buf = io.StringIO(text)
+    while True:
+        line = buf.readline()
+        if line == "":
+            break
+        line_no += 1
+        last_had_newline = line.endswith("\n") or line.endswith("\r")
         stripped = line.strip()
         if not stripped:
             continue
+        last_nonempty = line_no
         try:
             obj = json.loads(stripped)
-        except json.JSONDecodeError as exc:
-            if i == last_nonempty:
-                warnings.append(
-                    ParseWarning(
-                        path_label,
-                        i,
-                        "skipped truncated or partial last line (session may still be writing)",
-                    )
-                )
+        except json.JSONDecodeError:
+            if not last_had_newline:
+                truncated_last = line_no
             else:
-                warnings.append(
-                    ParseWarning(path_label, i, f"skipped malformed JSON ({exc.msg})")
-                )
+                malformed.append(line_no)
             continue
         if not isinstance(obj, dict):
-            warnings.append(ParseWarning(path_label, i, "skipped non-object JSONL record"))
+            malformed.append(line_no)
             continue
-        yield i, obj
+        yield line_no, obj
+    if truncated_last is None and malformed and last_nonempty == malformed[-1]:
+        truncated_last = malformed.pop()
+    bits: list[str] = []
+    if malformed:
+        bits.append(
+            f"{len(malformed)} malformed or non-JSON line(s) skipped ({_format_line_span(malformed)})"
+        )
+    if truncated_last is not None:
+        bits.append(
+            f"truncated or partial last line skipped (line {truncated_last}; session may still be writing)"
+        )
+    if bits:
+        warnings.append(ParseWarning(path_label, None, "; ".join(bits)))
 
 
 def _first_int(record: dict[str, Any], *keys: str) -> int | None:
@@ -444,6 +643,7 @@ def split_codex_usage(usage: dict[str, Any], label: str) -> TokenSplit | None:
             "output_tokens",
             "reasoning_output_tokens",
             "cache_creation_input_tokens",
+            "cache_write_input_tokens",
             "cached_input_tokens",
             "cache_read_input_tokens",
         )
@@ -452,7 +652,8 @@ def split_codex_usage(usage: dict[str, Any], label: str) -> TokenSplit | None:
         inp = _int_or_zero(usage, "input_tokens")
         out = _int_or_zero(usage, "output_tokens")
         reason = _int_or_zero(usage, "reasoning_output_tokens")
-        created = _int_or_zero(usage, "cache_creation_input_tokens")
+        # cache_write_input_tokens is the current Codex name for cache creation.
+        created = _first_int(usage, "cache_write_input_tokens", "cache_creation_input_tokens") or 0
         non_cached_input = max(0, inp - cache_read) if inp else 0
         return TokenSplit(non_cached_input + out + reason + created, cache_read, label)
     if "total_tokens" in usage and isinstance(usage["total_tokens"], (int, float)):
@@ -632,6 +833,7 @@ def parse_claude_file(
                     note="user_message",
                     is_sidechain=False,
                     record_type="user",
+                    anchor_type="type=user",
                 )
             )
             continue
@@ -721,26 +923,262 @@ def parse_claude_file(
     return events
 
 
+def _codex_session_name_from_path(path: Path) -> str:
+    name = path.name
+    if name.endswith(".jsonl.zst"):
+        name = name[: -len(".jsonl.zst")]
+    elif name.endswith(".jsonl"):
+        name = name[: -len(".jsonl")]
+    return name
+
+
+def _as_meta_dict(*candidates: Any) -> dict[str, Any]:
+    """Merge metadata dicts. Earlier candidates win on key conflicts.
+
+    Real Codex rollouts put client_authored / inherited_user_message on the
+    record's top-level metadata. payload.metadata is also consulted if present.
+    """
+    out: dict[str, Any] = {}
+    for cand in reversed([c for c in candidates if isinstance(c, dict)]):
+        out.update(cand)
+    return out
+
+
+def _stringify_path(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)):
+        parts = [str(x) for x in value if x is not None and str(x) != ""]
+        return "/".join(parts)
+    return str(value)
+
+
+def initiating_path_looks_nested(value: Any) -> bool:
+    """Unverified heuristic for a sub-agent initiating path.
+
+    The live vocabulary of initiating_agent_path has not been confirmed. This
+    only treats a value as nested when it has more than one path segment
+    (a '/' or '\\' in a string, or a list/tuple longer than 1). Other values
+    are recorded for --explain and are not used to decide.
+    """
+    if value is None or value is False:
+        return False
+    if isinstance(value, (list, tuple)):
+        return len([x for x in value if x is not None and str(x) != ""]) > 1
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return False
+        return ("/" in s) or ("\\" in s)
+    return False
+
+
+def classify_codex_user_message(role: Any, meta: dict[str, Any]) -> str:
+    """Classify a response_item message. Does not invent field meanings.
+
+    Preferred anchor: client_authored is True and inherited_user_message is not True.
+    If client_authored is absent, fall back to role=user and not developer.
+    inherited_user_message is True → not an anchor, even if client_authored is True.
+    client_authored is False → not an anchor.
+    """
+    if role == "developer":
+        return "developer"
+    if role != "user":
+        return "other"
+    if meta.get("inherited_user_message") is True:
+        return "inherited"
+    if meta.get("client_authored") is True:
+        return "anchor"
+    if meta.get("client_authored") is False:
+        return "non_client"
+    return "fallback_anchor"
+
+
+def _collect_turn_ids(obj: Any, into: set[str]) -> None:
+    if not isinstance(obj, dict):
+        return
+    for key in ("turn_id", "root_turn_id", "parent_turn_id"):
+        val = obj.get(key)
+        if val is not None and val != "":
+            into.add(str(val))
+
+
+def _extract_quota_events(
+    *,
+    source: str,
+    session_id: str,
+    path: Path,
+    ts: datetime | None,
+    rate: dict[str, Any],
+    record_type: str,
+) -> list[Event]:
+    """Split a rate_limits object into per-limit snapshots.
+
+    limit_id / limit_name may sit on rate_limits itself and/or on each
+    primary/secondary bucket. Grouping key is the most specific limit_id
+    available, falling back to the bucket label.
+    """
+    events: list[Event] = []
+    top_id = rate.get("limit_id")
+    top_name = rate.get("limit_name")
+    for label in ("primary", "secondary"):
+        bucket = rate.get(label)
+        if not isinstance(bucket, dict):
+            continue
+        pct = bucket.get("used_percent")
+        if not isinstance(pct, (int, float)):
+            continue
+        limit_id = bucket.get("limit_id", top_id)
+        limit_name = bucket.get("limit_name", top_name)
+        if limit_id is None or limit_id == "":
+            window = str(label)
+        else:
+            window = str(limit_id)
+        resets = parse_ts(bucket.get("resets_at"))
+        name = "" if limit_name is None else str(limit_name)
+        events.append(
+            Event(
+                source,
+                session_id,
+                str(path),
+                ts,
+                "quota",
+                used_percent=float(pct),
+                window_label=window,
+                note=f"window={label} window_minutes={bucket.get('window_minutes')} limit_name={name or 'n/a'}",
+                record_type=record_type,
+                limit_id=str(limit_id) if limit_id not in (None, "") else "",
+                limit_name=name,
+                resets_at=resets,
+            )
+        )
+    return events
+
+
+def _token_usage_from_record(payload: dict[str, Any]) -> tuple[TokenSplit | None, str, bool]:
+    """Return (split, source, is_cumulative) for a token_usage_record payload.
+
+    Preference: thread_token_usage as a cumulative total, else usage as a
+    single increment, else turn_token_usage as a fallback increment.
+    """
+    thread = payload.get("thread_token_usage")
+    if isinstance(thread, dict):
+        split = split_codex_usage(thread, "thread_token_usage")
+        if split is not None:
+            return split, "thread_token_usage", True
+    usage = payload.get("usage")
+    if isinstance(usage, dict):
+        split = split_codex_usage(usage, "token_usage_record.usage")
+        if split is not None:
+            return split, split.source, False
+    turn = payload.get("turn_token_usage")
+    if isinstance(turn, dict):
+        split = split_codex_usage(turn, "turn_token_usage")
+        if split is not None:
+            return split, "turn_token_usage", False
+    return None, "", False
+
+
 def parse_codex_file(
     path: Path, warnings: list[ParseWarning] | None = None
 ) -> list[Event]:
     if warnings is None:
         warnings = []
     events: list[Event] = []
-    session_id = path.stem
-    if session_id.endswith(".jsonl"):
-        session_id = session_id[: -len(".jsonl")]
+    token_count_usage: list[Event] = []
+    usage_record_events: list[Event] = []
+    session_id = _codex_session_name_from_path(path)
     last_new = 0
     last_cache = 0
     have_cumulative = False
+    rec_last_new = 0
+    rec_last_cache = 0
+    rec_have_cumulative = False
+    seen_response_ids: set[str] = set()
+    subagent_turns: set[str] = set()
 
     for line_no, rec in iter_jsonl(path, warnings):
         typ = rec.get("type")
         payload = rec.get("payload") if isinstance(rec.get("payload"), dict) else {}
         ts = parse_ts(rec.get("timestamp"))
         if typ == "session_meta":
-            session_id = str(payload.get("id") or session_id)
+            session_id = str(payload.get("id") or rec.get("id") or session_id)
             continue
+
+        # Sub-agent communication: collect any turn ids, do not guess more.
+        if typ == "inter_agent_communication_metadata":
+            _collect_turn_ids(payload, subagent_turns)
+            _collect_turn_ids(rec.get("metadata") if isinstance(rec.get("metadata"), dict) else {}, subagent_turns)
+            events.append(
+                Event(
+                    "codex",
+                    session_id,
+                    str(path),
+                    ts,
+                    "meta",
+                    note="inter_agent_communication_metadata",
+                    record_type="inter_agent_communication_metadata",
+                    turn_id=str(payload.get("turn_id") or ""),
+                    is_sidechain=True,
+                )
+            )
+            continue
+
+        # ---- user / assistant messages (current Codex shape) ----
+        if typ == "response_item" and payload.get("type") == "message":
+            role = payload.get("role")
+            meta = _as_meta_dict(rec.get("metadata"), payload.get("metadata"))
+            kind = classify_codex_user_message(role, meta)
+            turn_id = str(payload.get("turn_id") or rec.get("turn_id") or meta.get("turn_id") or "")
+            ev_kwargs = dict(
+                source="codex",
+                session_id=session_id,
+                path=str(path),
+                ts=ts,
+                turn_id=turn_id,
+                record_type=f"response_item/message role={role}",
+            )
+            if kind == "anchor":
+                ev = Event(kind="user", note="client_authored=true", anchor_type="client_authored=true", **ev_kwargs)
+            elif kind == "fallback_anchor":
+                ev = Event(
+                    kind="user",
+                    note="fallback: role=user, client_authored absent, not developer",
+                    anchor_type="fallback_role_user",
+                    **ev_kwargs,
+                )
+            elif kind == "inherited":
+                ev = Event(
+                    kind="inherited_user",
+                    note="inherited_user_message=true (not an anchor)",
+                    anchor_type="",
+                    **ev_kwargs,
+                )
+            elif kind == "developer":
+                ev = Event(kind="meta", note="role=developer (not an anchor)", **ev_kwargs)
+            elif kind == "non_client":
+                ev = Event(kind="meta", note="client_authored=false (not an anchor)", **ev_kwargs)
+            else:
+                # assistant or other roles: keep a quiet meta mark only for assistant traces
+                if role == "assistant":
+                    ev = Event(
+                        kind="meta",
+                        note="assistant_message",
+                        record_type="response_item/message role=assistant",
+                        session_id=session_id,
+                        source="codex",
+                        path=str(path),
+                        ts=ts,
+                        turn_id=turn_id,
+                    )
+                    events.append(ev)
+                continue
+            events.append(ev)
+            continue
+
+        # Legacy shape still accepted (older fixtures / older clients).
         if typ == "event_msg" and payload.get("type") == "user_message":
             events.append(
                 Event(
@@ -751,11 +1189,97 @@ def parse_codex_file(
                     "user",
                     note="user_message",
                     record_type="event_msg/user_message",
+                    anchor_type="event_msg/user_message",
                 )
             )
             continue
-        if typ != "event_msg" or payload.get("type") != "token_count":
+
+        if typ == "event_msg" and payload.get("type") == "task_started":
+            if ts is None:
+                ts = parse_ts(payload.get("started_at"))
+            attrib = payload.get("turn_attribution") if isinstance(payload.get("turn_attribution"), dict) else {}
+            trigger = attrib.get("turn_trigger")
+            # Also accept a top-level payload.turn_trigger if present.
+            if trigger is None:
+                trigger = payload.get("turn_trigger")
+            agent_path = attrib.get("initiating_agent_path")
+            trigger_s = "" if trigger is None else str(trigger)
+            path_s = _stringify_path(agent_path)
+            turn_id = str(attrib.get("turn_id") or payload.get("turn_id") or "")
+            root_turn = str(attrib.get("root_turn_id") or payload.get("root_turn_id") or "")
+            is_sub = initiating_path_looks_nested(agent_path)
+            if is_sub:
+                if turn_id:
+                    subagent_turns.add(turn_id)
+                if root_turn:
+                    subagent_turns.add(root_turn)
+            ev = Event(
+                "codex",
+                session_id,
+                str(path),
+                ts,
+                "turn_start",
+                note=f"task_started turn_trigger={trigger_s!s} initiating_agent_path={path_s!s}",
+                record_type="event_msg/task_started",
+                is_sidechain=is_sub,
+                turn_id=turn_id,
+                turn_trigger=trigger_s,
+                initiating_agent_path=path_s,
+            )
+            events.append(ev)
             continue
+
+        # New token_usage_record (preferred over event_msg/token_count).
+        if typ == "token_usage_record":
+            sid = payload.get("session_id")
+            if sid:
+                session_id = str(sid)
+            if ts is None:
+                ts = parse_ts(payload.get("timestamp"))
+            split, src, is_cum = _token_usage_from_record(payload)
+            response_id = str(payload.get("response_id") or "")
+            turn_id = str(payload.get("turn_id") or "")
+            if split is None:
+                continue
+            if response_id and response_id in seen_response_ids:
+                continue
+            if response_id:
+                seen_response_ids.add(response_id)
+            if is_cum:
+                if rec_have_cumulative:
+                    delta_new = max(0, split.new_tokens - rec_last_new)
+                    delta_cache = max(0, split.cache_read - rec_last_cache)
+                else:
+                    delta_new = split.new_tokens
+                    delta_cache = split.cache_read
+                rec_last_new = split.new_tokens
+                rec_last_cache = split.cache_read
+                rec_have_cumulative = True
+            else:
+                delta_new = split.new_tokens
+                delta_cache = split.cache_read
+            if delta_new or delta_cache:
+                ev = Event(
+                    "codex",
+                    session_id,
+                    str(path),
+                    ts,
+                    "usage",
+                    tokens=delta_new,
+                    cache_read=delta_cache,
+                    note=src,
+                    record_type="token_usage_record",
+                    response_id=response_id,
+                    turn_id=turn_id,
+                )
+                usage_record_events.append(ev)
+                events.append(ev)
+            continue
+
+        if typ != "event_msg" or payload.get("type") != "token_count":
+            # turn_context, world_state, compacted, item_completed, etc. are expected.
+            continue
+
         info = payload.get("info")
         if info is None and "rate_limits" not in payload:
             warnings.append(
@@ -805,45 +1329,49 @@ def parse_codex_file(
                 last_cache = split.cache_read
                 have_cumulative = True
             else:
-                # last_token_usage fallback: already a per-turn increment.
                 delta_new = split.new_tokens
                 delta_cache = split.cache_read
             if delta_new or delta_cache:
-                events.append(
-                    Event(
-                        "codex",
-                        session_id,
-                        str(path),
-                        ts,
-                        "usage",
-                        tokens=delta_new,
-                        cache_read=delta_cache,
-                        note=split.source,
-                        record_type="event_msg/token_count",
-                    )
+                ev = Event(
+                    "codex",
+                    session_id,
+                    str(path),
+                    ts,
+                    "usage",
+                    tokens=delta_new,
+                    cache_read=delta_cache,
+                    note=split.source,
+                    record_type="event_msg/token_count",
                 )
+                token_count_usage.append(ev)
+                events.append(ev)
         rate = payload.get("rate_limits")
         if isinstance(rate, dict):
-            for lbl in ("primary", "secondary"):
-                bucket = rate.get(lbl)
-                if not isinstance(bucket, dict):
-                    continue
-                pct = bucket.get("used_percent")
-                if isinstance(pct, (int, float)):
-                    events.append(
-                        Event(
-                            "codex",
-                            session_id,
-                            str(path),
-                            ts,
-                            "quota",
-                            used_percent=float(pct),
-                            window_label=lbl,
-                            note=f"window_minutes={bucket.get('window_minutes')}",
-                            record_type="event_msg/rate_limits",
-                        )
-                    )
+            events.extend(
+                _extract_quota_events(
+                    source="codex",
+                    session_id=session_id,
+                    path=path,
+                    ts=ts,
+                    rate=rate,
+                    record_type="event_msg/rate_limits",
+                )
+            )
+
+    # Prefer token_usage_record over event_msg/token_count usage in the same
+    # session so cumulative totals are not applied twice. Rate-limit snapshots
+    # from token_count are kept.
+    if usage_record_events:
+        drop = set(id(ev) for ev in token_count_usage)
+        events = [ev for ev in events if id(ev) not in drop]
+
+    if subagent_turns:
+        for ev in events:
+            if ev.turn_id and ev.turn_id in subagent_turns:
+                ev.is_sidechain = True
+
     return events
+
 
 
 def discover(root: Path, kind: str) -> list[Path]:
@@ -914,11 +1442,10 @@ def build_sessions(events: list[Event]) -> dict[str, SessionState]:
             st = SessionState(ev.source, ev.session_id, ev.path)
             sessions[key] = st
         st.events.append(ev)
-        if ev.is_sidechain:
-            st.is_sidechain = True
         if ev.kind == "user" and ev.ts and not ev.is_sidechain:
             if st.last_user_ts is None or ev.ts > st.last_user_ts:
                 st.last_user_ts = ev.ts
+                st.last_anchor_type = ev.anchor_type
         if ev.kind == "usage" and not ev.is_sidechain:
             st.total_tokens += ev.tokens
             st.total_cache_read += ev.cache_read
@@ -926,8 +1453,43 @@ def build_sessions(events: list[Event]) -> dict[str, SessionState]:
                 st.last_usage_ts = ev.ts
         if ev.kind == "quota" and ev.window_label and ev.used_percent is not None:
             st.last_used_percent[ev.window_label] = ev.used_percent
+    for st in sessions.values():
+        _finalize_session(st)
     return sessions
 
+
+def _finalize_session(st: SessionState) -> None:
+    """Set no_anchor_reason and whether the *whole* session is a sub-agent."""
+    main_users = [e for e in st.events if e.kind == "user" and not e.is_sidechain]
+    inherited = [e for e in st.events if e.kind == "inherited_user"]
+    side_users = [e for e in st.events if e.kind == "user" and e.is_sidechain]
+    main_usage = [e for e in st.events if e.kind == "usage" and not e.is_sidechain]
+    sub_activity = [
+        e
+        for e in st.events
+        if e.is_sidechain and e.kind in {"user", "usage", "turn_start", "inherited_user"}
+    ]
+    if main_users:
+        last = max(main_users, key=lambda e: e.ts or _min_utc())
+        st.last_user_ts = last.ts
+        st.last_anchor_type = last.anchor_type
+        st.no_anchor_reason = None
+        st.is_sidechain = False
+        return
+    st.last_user_ts = None
+    st.last_anchor_type = ""
+    if sub_activity and not main_usage and not main_users:
+        st.is_sidechain = True
+        st.no_anchor_reason = "sub_agent"
+        return
+    if side_users and not main_users:
+        st.is_sidechain = True
+        st.no_anchor_reason = "sub_agent"
+        return
+    if inherited:
+        st.no_anchor_reason = "all_inherited"
+        return
+    st.no_anchor_reason = "no_user_messages"
 
 
 @dataclass
@@ -945,6 +1507,8 @@ class Alert:
     first_idle_usage_ts: str
     last_usage_ts: str
     run_seconds: float | None = None
+    limit_id: str = ""
+    limit_name: str = ""
 
     def public_dict(
         self,
@@ -967,18 +1531,167 @@ def _min_utc() -> datetime:
 
 
 def _event_sort_key(ev: Event) -> tuple[datetime, int, str]:
-    # Time first. When timestamps tie, anchors and tool edges should be
-    # visible before usage so a same-second tool_result still extends activity.
     kind_rank = {
         "user": 0,
-        "tool_result": 1,
-        "tool_use": 2,
-        "meta": 3,
-        "sidechain": 4,
-        "quota": 5,
-        "usage": 6,
+        "turn_start": 1,
+        "tool_result": 2,
+        "tool_use": 3,
+        "inherited_user": 4,
+        "meta": 5,
+        "sidechain": 6,
+        "quota": 7,
+        "usage": 8,
     }
     return (ev.ts or _min_utc(), kind_rank.get(ev.kind, 9), ev.kind)
+
+
+def _session_percent_step_after_gap(
+    dated: list[Event],
+    last_anchor: datetime | None,
+    gap_start: datetime | None,
+    idle_seconds: int,
+    percent_threshold: float,
+) -> tuple[float | None, str]:
+    """Per-session percent step in the quiet gap, grouped by limit_id, ignoring window resets."""
+    if last_anchor is None or gap_start is None:
+        return None, ""
+    by_limit: dict[str, list[Event]] = defaultdict(list)
+    for ev in dated:
+        if ev.kind != "quota" or ev.used_percent is None or ev.ts is None:
+            continue
+        key = ev.limit_id or ev.window_label or "unknown"
+        by_limit[key].append(ev)
+    best_step = None
+    best_note = ""
+    for key, series in by_limit.items():
+        series = sorted(series, key=lambda e: e.ts or _min_utc())
+        # Split when resets_at changes so a new window is not a "rise".
+        segments: list[list[Event]] = []
+        cur: list[Event] = []
+        for ev in series:
+            if cur and ev.resets_at != cur[-1].resets_at:
+                segments.append(cur)
+                cur = [ev]
+            else:
+                cur.append(ev)
+        if cur:
+            segments.append(cur)
+        for seg in segments:
+            baseline = None
+            latest = None
+            name = ""
+            for ev in seg:
+                if ev.ts is None:
+                    continue
+                if ev.ts < last_anchor:
+                    continue
+                if (ev.ts - gap_start).total_seconds() < idle_seconds:
+                    baseline = ev.used_percent
+                    name = ev.limit_id or ev.window_label or key
+                else:
+                    if baseline is None:
+                        baseline = ev.used_percent
+                        name = ev.limit_id or ev.window_label or key
+                    latest = ev.used_percent
+                    name = ev.limit_id or ev.window_label or name or key
+            if baseline is None or latest is None:
+                continue
+            step = latest - baseline
+            if step >= percent_threshold and (best_step is None or step > best_step):
+                best_step = step
+                best_note = name
+    return best_step, best_note
+
+
+def detect_type_b_global(
+    sessions: dict[str, SessionState],
+    idle_seconds: int,
+    percent_threshold: float,
+) -> list[Alert]:
+    """Type B: used_percent rose for a limit_id with no local new tokens in that interval.
+
+    Snapshots are grouped by limit_id across all sessions (shared quota pools).
+    A change in resets_at starts a new window and is not treated as growth.
+    If any local, non-sub-agent session has new tokens in the open interval
+    (baseline_ts, later_ts], the rise is not reported as Type B.
+    """
+    usage_points: list[tuple[datetime, int]] = []
+    for st in sessions.values():
+        for ev in st.events:
+            # Sub-agent tokens still count as local-machine activity, so they
+            # suppress Type B even though those turns are excluded from Type A.
+            if ev.kind == "usage" and ev.ts and ev.tokens > 0:
+                usage_points.append((ev.ts, ev.tokens))
+
+    by_limit: dict[str, list[Event]] = defaultdict(list)
+    for st in sessions.values():
+        for ev in st.events:
+            if ev.kind == "quota" and ev.ts and ev.used_percent is not None:
+                key = ev.limit_id or ev.window_label or "unknown"
+                by_limit[key].append(ev)
+
+    alerts: list[Alert] = []
+    for key, series in by_limit.items():
+        series = sorted(series, key=lambda e: e.ts or _min_utc())
+        segments: list[list[Event]] = []
+        cur: list[Event] = []
+        for ev in series:
+            if cur and ev.resets_at != cur[-1].resets_at:
+                segments.append(cur)
+                cur = [ev]
+            else:
+                cur.append(ev)
+        if cur:
+            segments.append(cur)
+
+        best: tuple[float, Event, Event] | None = None
+        for seg in segments:
+            for earlier, later in zip(seg, seg[1:]):
+                if earlier.ts is None or later.ts is None:
+                    continue
+                span = (later.ts - earlier.ts).total_seconds()
+                if span < idle_seconds:
+                    continue
+                step = (later.used_percent or 0) - (earlier.used_percent or 0)
+                if step < percent_threshold:
+                    continue
+                local = sum(tok for ts, tok in usage_points if earlier.ts < ts <= later.ts)
+                if local > 0:
+                    continue
+                if best is None or step > best[0]:
+                    best = (step, earlier, later)
+        if best is None:
+            continue
+        step, earlier, later = best
+        lid = later.limit_id or earlier.limit_id or key
+        lname = later.limit_name or earlier.limit_name or ""
+        name_bit = f" ({lname})" if lname else ""
+        reason = (
+            f"Codex used_percent for limit_id={lid}{name_bit} rose by {step:.1f} "
+            f"between {iso(earlier.ts)} and {iso(later.ts)} with no matching new tokens "
+            "on any local session in that interval. Compared globally by limit_id; "
+            "a used_percent change across a resets_at window reset is not counted as growth. "
+            "This still cannot see other devices, Codex Cloud, or surfaces that do not write local logs."
+        )
+        alerts.append(
+            Alert(
+                severity="medium",
+                alert_type="B",
+                session_id=later.session_id,
+                source=later.source,
+                path=later.path,
+                reason=reason,
+                idle_tokens=0,
+                idle_cache_read=0,
+                percent_step=step,
+                last_user_ts="",
+                first_idle_usage_ts=iso(earlier.ts),
+                last_usage_ts=iso(later.ts),
+                limit_id=str(lid),
+                limit_name=lname,
+            )
+        )
+    return alerts
 
 
 def detect(
@@ -988,12 +1701,12 @@ def detect(
     percent_threshold: float,
     long_run_seconds: int = DEFAULT_LONG_RUN_SECONDS,
 ) -> list[Alert]:
-    """Anchor idle detection to the last real user input, in time order.
+    """Anchor Type A to the last real user input, in time order.
 
+    Type B is computed globally by limit_id (see detect_type_b_global).
     A long stretch of work that follows a user prompt without a quiet gap is
     not idle_drain. If it lasts at least long_run_seconds, a low-severity
-    long_run alert is emitted instead. cache_read is tracked but never added
-    to idle or long-run token totals.
+    long_run alert is emitted instead.
     """
     alerts: list[Alert] = []
     for st in sessions.values():
@@ -1001,14 +1714,14 @@ def detect(
             continue
 
         ordered = sorted(st.events, key=_event_sort_key)
-        # Drop timestamps that are missing from the time-ordered walk; they
-        # cannot be placed relative to the anchor.
         dated = [ev for ev in ordered if ev.ts is not None and not ev.is_sidechain]
 
         last_anchor: datetime | None = None
+        last_anchor_type = ""
         for ev in dated:
             if ev.kind == "user":
                 last_anchor = ev.ts
+                last_anchor_type = ev.anchor_type
 
         idle_tokens = 0
         idle_cache = 0
@@ -1017,7 +1730,6 @@ def detect(
         run_tokens = 0
         run_end: datetime | None = last_anchor
         outstanding = 0
-        percent_by_window: dict[str, list[tuple[datetime, float]]] = defaultdict(list)
 
         for ev in dated:
             if last_anchor is not None and ev.ts is not None and ev.ts < last_anchor:
@@ -1026,17 +1738,18 @@ def detect(
                 outstanding = 0
                 run_end = ev.ts
                 continue
+            if ev.kind == "turn_start":
+                # Recorded for explain. The trigger value is not interpreted,
+                # so this does not move the user anchor or the idle clock.
+                continue
             if ev.kind in {"tool_use", "tool_result"}:
                 outstanding = max(0, outstanding + ev.tool_delta)
                 if ev.ts:
                     run_end = ev.ts if run_end is None else max(run_end, ev.ts)
                 continue
-            if ev.kind == "meta":
-                # Injections do not move the user anchor. They also do not
-                # start an idle window on their own.
+            if ev.kind in {"meta", "inherited_user"}:
                 continue
-            if ev.kind == "quota" and ev.window_label and ev.used_percent is not None and ev.ts:
-                percent_by_window[ev.window_label].append((ev.ts, ev.used_percent))
+            if ev.kind == "quota":
                 continue
             if ev.kind != "usage" or ev.ts is None:
                 continue
@@ -1047,8 +1760,6 @@ def detect(
             if not tool_busy and last_anchor is not None and active_until is not None:
                 quiet = (ev.ts - active_until).total_seconds() >= idle_seconds
             elif last_anchor is None:
-                # No real user prompt in this file (truncated log, memory-only
-                # session, etc.). Do not treat the whole file as idle_drain.
                 quiet = False
 
             if quiet:
@@ -1061,54 +1772,11 @@ def detect(
                 run_tokens += ev.tokens
                 run_end = ev.ts if run_end is None else max(run_end, ev.ts)
 
-        # Type B: used_percent rose during the quiet window with no new tokens.
-        percent_step = None
-        percent_note = ""
-        if last_anchor is not None:
-            gap_start = run_end or last_anchor
-            for label, series in percent_by_window.items():
-                baseline = None
-                latest_idle = None
-                for ts, pct in series:
-                    if (ts - last_anchor).total_seconds() < 0:
-                        continue
-                    if (ts - gap_start).total_seconds() < idle_seconds:
-                        baseline = pct
-                    else:
-                        if baseline is None:
-                            baseline = pct
-                        latest_idle = pct
-                if baseline is None or latest_idle is None:
-                    continue
-                step = latest_idle - baseline
-                if step >= percent_threshold and (percent_step is None or step > percent_step):
-                    percent_step = step
-                    percent_note = label
-        else:
-            # Still allow a Type B note when percent moves across a long span
-            # with no local new tokens and no user anchor (e.g. ghost snapshots).
-            for label, series in percent_by_window.items():
-                if len(series) < 2:
-                    continue
-                span = (series[-1][0] - series[0][0]).total_seconds()
-                if span < idle_seconds:
-                    continue
-                step = series[-1][1] - series[0][1]
-                if step >= percent_threshold and (percent_step is None or step > percent_step):
-                    percent_step = step
-                    percent_note = label
+        percent_step, percent_note = _session_percent_step_after_gap(
+            dated, last_anchor, run_end or last_anchor, idle_seconds, percent_threshold
+        )
 
         has_a = idle_tokens >= token_threshold
-        has_b = (
-            percent_step is not None
-            and percent_step >= percent_threshold
-            and idle_tokens == 0
-        )
-        has_percent_with_tokens = (
-            percent_step is not None
-            and percent_step >= percent_threshold
-            and idle_tokens > 0
-        )
         run_seconds = None
         if last_anchor is not None and run_end is not None:
             run_seconds = (run_end - last_anchor).total_seconds()
@@ -1118,46 +1786,35 @@ def detect(
             and run_tokens >= token_threshold
         )
 
-        if has_a or has_b or has_percent_with_tokens:
-            if has_a and has_b:
-                alert_type = "A+B"
-            elif has_a:
-                alert_type = "A"
-            else:
-                alert_type = "B"
-            parts = []
-            if has_a:
-                parts.append(
-                    f"new tokens grew by {idle_tokens} after a quiet gap of >= {idle_seconds}s "
-                    f"from the last real user input (cache_read +{idle_cache} not counted)"
-                )
+        if has_a:
+            parts = [
+                f"new tokens grew by {idle_tokens} after a quiet gap of >= {idle_seconds}s "
+                f"from the last real user input (cache_read +{idle_cache} not counted)"
+            ]
+            if last_anchor_type:
+                parts.append(f"anchor type: {last_anchor_type}")
             if percent_step is not None and percent_step >= percent_threshold:
                 parts.append(
-                    f"Codex {percent_note or 'quota'} used_percent rose by {percent_step:.1f} during the quiet gap"
+                    f"Codex {percent_note or 'quota'} used_percent also rose by {percent_step:.1f} during the quiet gap"
                 )
-                if idle_tokens == 0:
-                    parts.append(
-                        "no matching local new-token delta (possible other device, "
-                        "cloud task, shared quota pool, or accounting lag)"
-                    )
             if first_idle_ts and last_anchor and first_idle_ts < last_anchor:
-                # Should be impossible after the last-anchor rule; keep a guard.
                 parts.append("internal warning: first idle timestamp precedes the user anchor")
             alerts.append(
                 Alert(
                     severity="medium",
-                    alert_type=alert_type,
+                    alert_type="A",
                     session_id=st.session_id,
                     source=st.source,
                     path=st.path,
                     reason="; ".join(parts),
                     idle_tokens=idle_tokens,
                     idle_cache_read=idle_cache,
-                    percent_step=percent_step if (has_b or has_percent_with_tokens) else percent_step,
+                    percent_step=percent_step,
                     last_user_ts=iso(last_anchor),
                     first_idle_usage_ts=iso(first_idle_ts),
                     last_usage_ts=iso(last_idle_ts or st.last_usage_ts),
                     run_seconds=run_seconds,
+                    limit_id=percent_note if percent_note else "",
                 )
             )
 
@@ -1183,7 +1840,10 @@ def detect(
                     run_seconds=run_seconds,
                 )
             )
+
+    alerts.extend(detect_type_b_global(sessions, idle_seconds, percent_threshold))
     return alerts
+
 
 
 def visible_alerts(alerts: list[Alert], min_severity: str) -> list[Alert]:
@@ -1204,6 +1864,7 @@ class ScanSummary:
     sessions: int
     sessions_sidechain_excluded: int
     sessions_no_user_anchor: int
+    sessions_no_user_anchor_by_reason: dict[str, int]
     alerts_by_type: dict[str, int]
     alerts_shown: int
     alerts_hidden: int
@@ -1246,7 +1907,10 @@ def _build_summary(
         sessions=len(sessions),
         sessions_sidechain_excluded=sum(1 for st in sessions.values() if st.is_sidechain),
         sessions_no_user_anchor=sum(
-            1 for st in sessions.values() if not st.is_sidechain and st.last_user_ts is None
+            1 for st in sessions.values() if st.last_user_ts is None
+        ),
+        sessions_no_user_anchor_by_reason=dict(
+            Counter(st.no_anchor_reason for st in sessions.values() if st.last_user_ts is None and st.no_anchor_reason)
         ),
         alerts_by_type=type_counts,
         alerts_shown=len(shown),
@@ -1363,8 +2027,18 @@ def format_summary_lines(summary: ScanSummary) -> list[str]:
         ),
         (
             f"Sessions: {summary.sessions} "
-            f"(sidechain excluded from idle detection: {summary.sessions_sidechain_excluded}; "
-            f"no real user input: {summary.sessions_no_user_anchor})."
+            f"(sidechain/sub-agent excluded from idle detection: {summary.sessions_sidechain_excluded}; "
+            f"no real user input: {summary.sessions_no_user_anchor}"
+            + (
+                " — "
+                + ", ".join(
+                    f"{ {'no_user_messages': 'no user messages', 'all_inherited': 'all inherited', 'sub_agent': 'sub-agent'}.get(k, k)}: {v}"
+                    for k, v in sorted(summary.sessions_no_user_anchor_by_reason.items())
+                )
+                if summary.sessions_no_user_anchor_by_reason
+                else ""
+            )
+            + ")."
         ),
         f"Alerts: {alert_bits} (shown: {summary.alerts_shown}{hidden}).",
         (
@@ -1392,10 +2066,24 @@ def _timeline_lines(st: SessionState, *, anchor: datetime | None = None) -> list
         ts = iso(ev.ts) or "unknown time"
         marks: list[str] = []
         if ev.kind == "user":
-            marks.append("ANCHOR" if ev.ts == anchor or (anchor and ev.ts == anchor) else "real user input")
+            atype = ev.anchor_type or "real user input"
             if ev.ts and anchor and ev.ts == anchor:
-                marks = ["ANCHOR (last real user input)"]
+                marks = [f"ANCHOR (last real user input; {atype})"]
+            else:
+                marks = [f"real user input ({atype})"]
             lines.append(f"  - {ts}  user  {' '.join(marks)}")
+        elif ev.kind == "inherited_user":
+            lines.append(f"  - {ts}  inherited_user  (not an anchor; inherited_user_message=true)")
+        elif ev.kind == "turn_start":
+            extra = []
+            if ev.turn_trigger:
+                extra.append(f"turn_trigger={ev.turn_trigger}")
+            if ev.initiating_agent_path:
+                extra.append(f"initiating_agent_path={ev.initiating_agent_path}")
+            if ev.is_sidechain:
+                extra.append("sub-agent turn; excluded from idle detection")
+            suffix = ("  " + " ".join(extra)) if extra else ""
+            lines.append(f"  - {ts}  task_started{suffix}")
         elif ev.kind == "tool_result":
             lines.append(f"  - {ts}  tool_result  (not a user anchor; tool_delta={ev.tool_delta})")
         elif ev.kind == "tool_use":
@@ -1408,7 +2096,14 @@ def _timeline_lines(st: SessionState, *, anchor: datetime | None = None) -> list
             label = ev.window_label or "quota"
             pct = ev.used_percent
             pct_s = f"{pct:.1f}" if pct is not None else "n/a"
-            lines.append(f"  - {ts}  quota  {label} used_percent={pct_s}")
+            bits = [f"{label} used_percent={pct_s}"]
+            if ev.limit_id:
+                bits.append(f"limit_id={ev.limit_id}")
+            if ev.limit_name:
+                bits.append(f"limit_name={ev.limit_name}")
+            if ev.resets_at:
+                bits.append(f"resets_at={iso(ev.resets_at)}")
+            lines.append(f"  - {ts}  quota  {' '.join(bits)}")
         elif ev.kind == "meta":
             lines.append(f"  - {ts}  meta  {ev.note or ev.record_type}  (not a user anchor)")
         elif ev.kind == "sidechain":
@@ -1440,6 +2135,7 @@ def render_explain(
         f"- File: `{path}`",
         f"- Sidechain / sub-agent session: {'yes' if st.is_sidechain else 'no'}",
         f"- Last real user input (UTC): {iso(st.last_user_ts) or 'none in this file'}",
+        f"- Anchor type: {st.last_anchor_type or ('real user input' if st.last_user_ts else 'none — ' + (st.no_anchor_reason or 'unknown'))}",
         f"- New tokens (input+output+cache_creation): {st.total_tokens}",
         f"- cache_read (not counted in idle increment): {st.total_cache_read}",
         "",
@@ -1524,10 +2220,18 @@ def render_report(
             extra = ""
             if st.is_sidechain:
                 extra = "; sidechain/sub-agent (excluded from idle detection)"
+                if not st.last_user_ts:
+                    extra += "; no real user input (sub-agent)"
             elif st.last_user_ts:
-                extra = f"; last real user input (UTC): {iso(st.last_user_ts)}"
+                extra = f"; last real user input (UTC): {iso(st.last_user_ts)}; anchor type: {st.last_anchor_type or 'n/a'}"
             else:
-                extra = "; no real user input in this file"
+                reason = st.no_anchor_reason or "unknown"
+                label = {
+                    "no_user_messages": "no user messages",
+                    "all_inherited": "all inherited",
+                    "sub_agent": "sub-agent",
+                }.get(reason, reason)
+                extra = f"; no real user input ({label})"
             lines.append(
                 f"- {st.source} / `{sid}` — new tokens: {st.total_tokens}; "
                 f"cache_read: {st.total_cache_read}{extra}"
@@ -1544,9 +2248,10 @@ def render_report(
     type_note = {
         "A": "Type A — new tokens grew after a quiet gap following the last real user input.",
         "B": (
-            "Type B — quota percent rose with no matching local new-token delta. "
-            "Local logs cannot see other devices, Codex Cloud / scheduled tasks, or a shared quota pool "
-            "(some plans share usage across Codex, ChatGPT, and other surfaces). Accounting may also lag."
+            "Type B — quota percent rose for a limit_id, compared across all local sessions, "
+            "with no matching new-token delta on any of them in that interval. "
+            "Window resets (a change in resets_at) are not counted as growth. "
+            "This still cannot see other devices, Codex Cloud, or surfaces that do not write local logs."
         ),
         "A+B": "Type A+B — new-token growth and a quota-percent step after a quiet gap.",
         "long_run": (
@@ -2109,6 +2814,7 @@ def _summary_dict(summary: ScanSummary) -> dict[str, Any]:
         "sessions": summary.sessions,
         "sessions_sidechain_excluded": summary.sessions_sidechain_excluded,
         "sessions_no_user_anchor": summary.sessions_no_user_anchor,
+        "sessions_no_user_anchor_by_reason": summary.sessions_no_user_anchor_by_reason,
         "alerts_by_type": summary.alerts_by_type,
         "alerts_shown": summary.alerts_shown,
         "alerts_hidden": summary.alerts_hidden,

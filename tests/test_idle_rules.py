@@ -238,7 +238,8 @@ class TestExplainAndSummary(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, msg=proc.stderr + proc.stdout)
         self.assertIn("# explain sess-idle", proc.stdout)
-        self.assertIn("ANCHOR (last real user input)", proc.stdout)
+        self.assertIn("ANCHOR (last real user input;", proc.stdout)
+        self.assertIn("Anchor type: type=user", proc.stdout)
         self.assertIn("new_tokens=+750", proc.stdout)
         self.assertIn("cache_read=+50000", proc.stdout)
         self.assertNotIn("please review this file", proc.stdout)
@@ -300,10 +301,10 @@ class TestExplainAndSummary(unittest.TestCase):
 
 
 class TestVersion(unittest.TestCase):
-    def test_version_is_0_2_0(self) -> None:
+    def test_version_is_0_3_0(self) -> None:
         proc = run_cli(["--version"])
         self.assertEqual(proc.returncode, 0)
-        self.assertIn("0.2.0", proc.stdout)
+        self.assertIn("0.3.0", proc.stdout)
 
 
 if __name__ == "__main__":

@@ -107,8 +107,9 @@ class TestEightOneSamples(unittest.TestCase):
         self.assertEqual(alert.alert_type, "B")
         self.assertEqual(alert.idle_tokens, 0)
         self.assertAlmostEqual(alert.percent_step or 0, 28.0)
-        self.assertIn("no matching local new-token delta", alert.reason)
-        self.assertIn("shared quota pool", alert.reason)
+        self.assertIn("no matching new tokens on any local session", alert.reason)
+        self.assertIn("limit_id", alert.reason)
+        self.assertIn("resets_at", alert.reason)
 
 
 class TestDedup(unittest.TestCase):
@@ -136,7 +137,8 @@ class TestTruncatedAndOddRecords(unittest.TestCase):
         self.assertEqual(usage[0].tokens, 18)
         self.assertTrue(any("truncated or partial last line" in w.message for w in warnings))
         # The tool must still have counted the complete earlier line.
-        self.assertTrue(any(w.line == 3 for w in warnings))
+        # Malformed-line warnings are aggregated per file (line is in the message).
+        self.assertTrue(any("line 3" in w.message for w in warnings))
 
     def test_missing_and_unknown_usage_fields_warn_and_skip(self) -> None:
         path = EXTRA_CLAUDE / "projects" / "demo-sub" / "sess-odd.jsonl"
@@ -400,7 +402,7 @@ class TestCLI(unittest.TestCase):
     def test_version(self) -> None:
         proc = run_cli(["--version"])
         self.assertEqual(proc.returncode, 0, msg=proc.stderr)
-        self.assertIn("0.2.0", proc.stdout)
+        self.assertIn("0.3.0", proc.stdout)
 
     def test_default_subcommand_is_scan(self) -> None:
         with_scan = run_cli(

@@ -78,7 +78,10 @@ An idle-drain alert looks like this (session id hashed unless you pass `--no-has
         first post-gap usage: 2026-11-10T01:04:10+00:00
 ```
 
-Type B (quota percent moved, no local new tokens) mentions other devices, cloud/scheduled tasks, a shared quota pool, or accounting lag. That is a limitation of local logs, not a proof of a billing error.
+Type B (quota percent moved, no local new tokens) is compared by `limit_id` across all local sessions. A `resets_at` window reset is not counted as growth, and activity in any other local session on the same pool suppresses the alert. The report still notes that other devices, Codex Cloud, or surfaces that do not write local logs are invisible. That is a limitation of local logs, not a proof of a billing error.
+
+The summary classifies sessions with **no real user input** as `no user messages`, `all inherited`, or `sub-agent`. `--explain` prints the user-input **anchor type** (`client_authored=true`, `fallback_role_user`, or the older `event_msg/user_message`) without prompt text. Malformed or non-JSON lines in one file are reported as a single "N lines skipped" warning, not one line per record.
+
 
 `long_run` means the agent kept working after you typed a prompt, with no quiet gap, for longer than `--long-run-seconds`. It is **not** classified as idle drain. Those lines are hidden unless you pass `--min-severity low`.
 
