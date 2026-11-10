@@ -16,6 +16,10 @@ It is **not an official quota dashboard**. It does not contact OpenAI or Anthrop
 - **No process control.** It will not kill or interrupt `claude` or `codex`.
 - **Constructed samples in this repo are not real user logs.** Run it on your own machine before you trust the numbers.
 
+## Validation so far
+
+I have run quota-guard on my own real local Claude Code and Codex session logs, not only on the constructed fixtures in this repository. So far it has **not** flagged a confirmed idle-drain event on those logs. A report from this tool is a local timeline of counts and timestamps. It is a clue, not proof that official billing is wrong.
+
 ## Install and run
 
 Requires **Python 3.11+** (the standard library only; `check-config` uses `tomllib`).
@@ -69,7 +73,7 @@ Useful flags (on `scan` and `report`):
 | `--long-run-seconds` | Continuous work longer than this is `long_run`, not idle drain, default 1800 |
 | `--min-severity` | `low` / `medium` / `high`; default `medium` hides `long_run` |
 | `--explain SESSION_HASH` | Print only that session's timeline (no prompt text) |
-| `--report PATH` | Write a markdown evidence report |
+| `--report PATH` | Write a markdown timeline report (counts and timestamps only; not proof of a billing bug) |
 | `--json` | Machine-readable stdout, including the summary object |
 | `--no-hash` | Show raw session ids (default: SHA-256 prefix) |
 | `--no-redact-home` | Leave home-directory prefixes in paths (default: replace with `~`) |
