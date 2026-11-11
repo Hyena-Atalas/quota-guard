@@ -1,5 +1,7 @@
 # quota-guard
 
+Sessmeter is the working name for this project; the CLI and repo are still quota-guard.
+
 **Waitlist:** [join here](https://docs.google.com/forms/d/e/1FAIpQLSdAGJXUIATq7lv0Au0DtOY84om0Mwnlhi-JDqXmHhhQVGZH9g/viewform)
 
 
